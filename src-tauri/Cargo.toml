@@ -1,0 +1,15 @@
+[package]
+name = "tablet2screen-host"
+version = "0.6.0"
+description = "Tablet2Screen Windows host"
+authors = ["Tablet2Screen"]
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = [] }
+windows = { version = "0.58", features = ["Win32_Foundation", "Win32_Graphics_Gdi"] }
