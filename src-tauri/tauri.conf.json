@@ -4,8 +4,6 @@
   "version": "0.6.0",
   "identifier": "dev.tablet2screen.host",
   "build": {
-    "beforeDevCommand": "npm run dev",
-    "devUrl": "http://localhost:1420",
     "beforeBuildCommand": "npm run build",
     "frontendDist": "../dist"
   },
@@ -26,6 +24,6 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "icon": ["icons/icon.ico"]
+    "icon": ["../icon.png", "icons/icon.ico"]
   }
 }

@@ -16,11 +16,31 @@ type StreamStats = {
   running: boolean;
   status: string;
   encoder: string;
+  ffmpeg_command: string;
   packets: number;
   vcl_packets: number;
+  keyframe_packets: number;
   bytes: number;
   fps: number;
   mbps: number;
+  current_fps: number;
+  current_mbps: number;
+  current_max_packet_bytes: number;
+  max_packet_bytes: number;
+  max_keyframe_bytes: number;
+  max_delta_frame_bytes: number;
+  ffmpeg_reads: number;
+  ffmpeg_read_bytes: number;
+  parser_buffer_bytes: number;
+  max_read_gap_ms: number;
+  socket_write_blocked_events: number;
+  socket_write_blocked_ms: number;
+  max_socket_write_ms: number;
+  paced_packets: number;
+  paced_sleep_ms: number;
+  max_packet_send_ms: number;
+  sender_queue_depth: number;
+  host_dropped_packets: number;
   elapsed_seconds: number;
   last_error: string;
 };
@@ -83,15 +103,25 @@ app.innerHTML = `
             <select id="encoderSelect">
               <option value="auto">Auto</option>
               <option value="hevc_nvenc">HEVC NVENC</option>
-              <option value="hevc_qsv">HEVC Quick Sync</option>
+              <option value="hevc_qsv">HEVC Intel Quick Sync / Arc</option>
               <option value="libx265">libx265 fallback</option>
             </select>
           </label>
-          <label>FPS<input id="fpsInput" type="number" min="1" max="120" value="30" /></label>
-          <label>Bitrate<input id="bitrateInput" value="20M" /></label>
-          <label>VBV buffer<input id="bufsizeInput" value="1M" /></label>
-          <label>GOP<input id="gopInput" type="number" min="1" value="15" /></label>
+          <label>Capture
+            <select id="captureSelect">
+              <option value="ddagrab">DXGI zero-copy when possible</option>
+              <option value="ddagrab_zero_copy">DXGI zero-copy / NVENC</option>
+              <option value="ddagrab_compat">DXGI compatibility</option>
+              <option value="gfxcapture">Windows Graphics Capture experimental</option>
+              <option value="gdigrab">GDI fallback</option>
+            </select>
+          </label>
+          <label>FPS<input id="fpsInput" type="number" min="1" max="120" value="60" /></label>
+          <label>Bitrate<input id="bitrateInput" value="70M" /></label>
+          <label>VBV buffer<input id="bufsizeInput" value="4M" /></label>
+          <label>GOP<input id="gopInput" type="number" min="1" value="60" /></label>
           <label>Scale<input id="scaleInput" value="1920:1080" /></label>
+          <label class="checkboxLabel"><input id="sendPacingInput" type="checkbox" checked /> Pace oversized frame sends</label>
           <label>Forwarded host:port<input id="targetInput" value="127.0.0.1:17005" /></label>
         </div>
         <div class="buttonRow primaryActions">
@@ -108,6 +138,7 @@ app.innerHTML = `
           <div><strong id="packetValue">0</strong><span>Packets</span></div>
           <div><strong id="elapsedValue">0.0</strong><span>Seconds</span></div>
         </div>
+        <div class="summary" id="diagnosticSummary">No stream diagnostics yet.</div>
         <div id="errorBox" class="errorBox hidden"></div>
       </article>
     </section>
@@ -127,17 +158,21 @@ const ffmpegPath = getInput('ffmpegPath');
 const displaySelect = getSelect('displaySelect');
 const displaySummary = getElement('displaySummary');
 const encoderSelect = getSelect('encoderSelect');
+const captureSelect = getSelect('captureSelect');
 const fpsInput = getInput('fpsInput');
 const bitrateInput = getInput('bitrateInput');
 const bufsizeInput = getInput('bufsizeInput');
 const gopInput = getInput('gopInput');
 const scaleInput = getInput('scaleInput');
+const sendPacingInput = getInput('sendPacingInput');
 const targetInput = getInput('targetInput');
 const statusPill = getElement('statusPill');
 const logElement = getElement('log');
 const errorBox = getElement('errorBox');
+const diagnosticSummary = getElement('diagnosticSummary');
 
 let displays: DisplayInfo[] = [];
+let lastHostLogAt = 0;
 
 void listen<StreamStats>('stream-stats', (event) => {
   renderStats(event.payload);
@@ -170,16 +205,22 @@ getButton('startButton').addEventListener('click', async () => {
       hdcPath: hdcPath.value,
       ffmpegPath: ffmpegPath.value,
       encoder: encoderSelect.value,
+      captureBackend: captureSelect.value,
       displayId: Number(displaySelect.value),
       fps: Number(fpsInput.value),
       bitrate: bitrateInput.value,
       bufsize: bufsizeInput.value,
       gop: Number(gopInput.value),
       scale: scaleInput.value,
+      sendPacing: sendPacingInput.checked,
       host: host || '127.0.0.1',
       port: Number(portText || 17005),
     };
     await invoke('start_stream', { config });
+    const stats = await invoke<StreamStats>('get_stream_stats');
+    if (stats.ffmpeg_command) {
+      appendLog(`FFmpeg: ${stats.ffmpeg_command}`);
+    }
     appendLog('Stream start requested.');
   });
 });
@@ -235,12 +276,39 @@ function renderStats(stats: StreamStats): void {
   getElement('elapsedValue').textContent = stats.elapsed_seconds.toFixed(1);
   statusPill.textContent = `${stats.running ? 'Streaming' : 'Idle'} · ${stats.status} · ${stats.encoder}`;
   statusPill.className = `pill ${stats.running ? 'connected' : 'idle'}`;
+  diagnosticSummary.textContent =
+    `Now ${stats.current_fps.toFixed(1)} VCL/s, ${stats.current_mbps.toFixed(1)} Mbps · ` +
+    `max frame ${(stats.current_max_packet_bytes / 1024).toFixed(0)} KiB · ` +
+    `max read gap ${stats.max_read_gap_ms.toFixed(1)} ms · ` +
+    `socket stalls ${stats.socket_write_blocked_events} / ${stats.socket_write_blocked_ms.toFixed(1)} ms, max ${stats.max_socket_write_ms.toFixed(1)} ms · ` +
+    `pacing ${stats.paced_packets} / ${stats.paced_sleep_ms.toFixed(1)} ms · ` +
+    `queue ${stats.sender_queue_depth}, host drops ${stats.host_dropped_packets} · ` +
+    `parser buffered ${stats.parser_buffer_bytes} B`;
+  maybeLogHostDiagnostics(stats);
   if (stats.last_error) {
     errorBox.textContent = stats.last_error;
     errorBox.classList.remove('hidden');
   } else {
     errorBox.classList.add('hidden');
   }
+}
+
+function maybeLogHostDiagnostics(stats: StreamStats): void {
+  if (!stats.running) return;
+  const now = Date.now();
+  if (now - lastHostLogAt < 2500) return;
+  lastHostLogAt = now;
+  appendLog(
+    `Host diag: access_unit, now=${stats.current_fps.toFixed(1)} VCL/s ${stats.current_mbps.toFixed(1)} Mbps, ` +
+      `avg=${stats.fps.toFixed(1)} VCL/s ${stats.mbps.toFixed(1)} Mbps, ` +
+      `keyframes=${stats.keyframe_packets}, maxFrame=${(stats.max_packet_bytes / 1024).toFixed(0)}KiB, ` +
+      `maxKey=${(stats.max_keyframe_bytes / 1024).toFixed(0)}KiB, maxDelta=${(stats.max_delta_frame_bytes / 1024).toFixed(0)}KiB, ` +
+      `ffmpegReads=${stats.ffmpeg_reads}, readGapMax=${stats.max_read_gap_ms.toFixed(1)}ms, ` +
+      `socketStalls=${stats.socket_write_blocked_events}/${stats.socket_write_blocked_ms.toFixed(1)}ms max=${stats.max_socket_write_ms.toFixed(1)}ms, ` +
+      `paced=${stats.paced_packets}/${stats.paced_sleep_ms.toFixed(1)}ms sendMax=${stats.max_packet_send_ms.toFixed(1)}ms, ` +
+      `queue=${stats.sender_queue_depth} hostDrops=${stats.host_dropped_packets}, ` +
+      `parserBuffered=${stats.parser_buffer_bytes}B`
+  );
 }
 
 async function runAction(label: string, action: () => Promise<void>): Promise<void> {
