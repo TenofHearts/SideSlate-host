@@ -28,6 +28,8 @@ pub const CAP_KEYFRAME_REQUEST: u32 = 0x0000_0008;
 
 pub const CODEC_HEVC: u8 = 1;
 
+pub const RECEIVER_STATS_PAYLOAD_SIZE: usize = 152;
+
 #[derive(Debug, Clone)]
 pub struct Message {
     pub message_type: u8,
@@ -156,6 +158,91 @@ pub fn video_config_payload(
     payload.extend_from_slice(&gop.to_le_bytes());
     payload.extend_from_slice(&0u16.to_le_bytes());
     payload
+}
+
+fn read_u32_le(data: &[u8], offset: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(
+        data.get(offset..offset + 4)?.try_into().ok()?,
+    ))
+}
+
+fn read_u64_le(data: &[u8], offset: usize) -> Option<u64> {
+    Some(u64::from_le_bytes(
+        data.get(offset..offset + 8)?.try_into().ok()?,
+    ))
+}
+
+fn read_i32_le(data: &[u8], offset: usize) -> Option<i32> {
+    Some(i32::from_le_bytes(
+        data.get(offset..offset + 4)?.try_into().ok()?,
+    ))
+}
+
+fn read_f64_le(data: &[u8], offset: usize) -> Option<f64> {
+    Some(f64::from_le_bytes(
+        data.get(offset..offset + 8)?.try_into().ok()?,
+    ))
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct ReceiverStats {
+    pub running: bool,
+    pub decoder_started: bool,
+    pub surface_ready: bool,
+    pub packets: u64,
+    pub bytes: u64,
+    pub queued_inputs: u64,
+    pub rendered_outputs: u64,
+    pub dropped_packets: u64,
+    pub sequence_gaps: u64,
+    pub config_packets: u64,
+    pub keyframes: u64,
+    pub last_sequence: u32,
+    pub queue_depth: u32,
+    pub stream_width: i32,
+    pub stream_height: i32,
+    pub stream_fps: i32,
+    pub last_error: i32,
+    pub receive_mbps: f64,
+    pub input_fps: f64,
+    pub render_fps: f64,
+    pub drop_fps: f64,
+    pub max_receive_gap_ms: f64,
+    pub max_input_gap_ms: f64,
+    pub max_render_gap_ms: f64,
+}
+
+pub fn parse_receiver_stats_payload(payload: &[u8]) -> Option<ReceiverStats> {
+    if payload.len() < RECEIVER_STATS_PAYLOAD_SIZE {
+        return None;
+    }
+    let flags = read_u32_le(payload, 0)?;
+    Some(ReceiverStats {
+        running: flags & 0x01 != 0,
+        decoder_started: flags & 0x02 != 0,
+        surface_ready: flags & 0x04 != 0,
+        packets: read_u64_le(payload, 8)?,
+        bytes: read_u64_le(payload, 16)?,
+        queued_inputs: read_u64_le(payload, 24)?,
+        rendered_outputs: read_u64_le(payload, 32)?,
+        dropped_packets: read_u64_le(payload, 40)?,
+        sequence_gaps: read_u64_le(payload, 48)?,
+        config_packets: read_u64_le(payload, 56)?,
+        keyframes: read_u64_le(payload, 64)?,
+        last_sequence: read_u32_le(payload, 72)?,
+        queue_depth: read_u32_le(payload, 76)?,
+        stream_width: read_i32_le(payload, 80)?,
+        stream_height: read_i32_le(payload, 84)?,
+        stream_fps: read_i32_le(payload, 88)?,
+        last_error: read_i32_le(payload, 92)?,
+        receive_mbps: read_f64_le(payload, 96)?,
+        input_fps: read_f64_le(payload, 104)?,
+        render_fps: read_f64_le(payload, 112)?,
+        drop_fps: read_f64_le(payload, 120)?,
+        max_receive_gap_ms: read_f64_le(payload, 128)?,
+        max_input_gap_ms: read_f64_le(payload, 136)?,
+        max_render_gap_ms: read_f64_le(payload, 144)?,
+    })
 }
 
 pub fn expect_type(message: Message, expected: u8) -> Result<Message, String> {

@@ -3,20 +3,24 @@
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::fs::OpenOptions;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::mem::size_of;
 use std::net::TcpStream;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, State};
+use windows::core::PCWSTR;
 use windows::Win32::Foundation::{BOOL, LPARAM, RECT};
+use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1};
 use windows::Win32::Graphics::Gdi::{
-    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFOEXW,
+    EnumDisplayDevicesW, EnumDisplayMonitors, GetMonitorInfoW, DISPLAY_DEVICEW, HDC, HMONITOR,
+    MONITORINFOEXW,
 };
 
 mod protocol;
@@ -24,6 +28,10 @@ mod protocol;
 const DEFAULT_HDC: &str =
     r"D:\Program\Huawei\DevEco Studio\sdk\default\openharmony\toolchains\hdc.exe";
 const DEFAULT_FFMPEG: &str = r"D:\Program\ffmpeg-8.1.1\bin\ffmpeg.exe";
+const NATIVE_TARGET_SCALE: &str = "2800:1840";
+const NATIVE_TARGET_BITRATE: &str = "35M";
+const NATIVE_TARGET_BUFSIZE: &str = "2M";
+const NATIVE_TARGET_GOP_60: u32 = 15;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
@@ -31,11 +39,17 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 struct DisplayInfo {
     id: usize,
     name: String,
+    device_string: String,
     left: i32,
     top: i32,
     width: i32,
     height: i32,
     primary: bool,
+    virtual_display: bool,
+    hmonitor: u64,
+    dxgi_adapter_idx: Option<u32>,
+    dxgi_output_idx: Option<u32>,
+    dxgi_adapter_name: String,
 }
 
 #[derive(Clone, Deserialize)]
@@ -86,6 +100,34 @@ struct StreamStats {
     max_packet_send_ms: f64,
     sender_queue_depth: u64,
     host_dropped_packets: u64,
+    resync_events: u64,
+    resync_dropped_access_units: u64,
+    bottleneck: String,
+    effective_capture_backend: String,
+    receiver_running: bool,
+    receiver_decoder_started: bool,
+    receiver_surface_ready: bool,
+    receiver_packets: u64,
+    receiver_bytes: u64,
+    receiver_queued_inputs: u64,
+    receiver_rendered_outputs: u64,
+    receiver_dropped_packets: u64,
+    receiver_sequence_gaps: u64,
+    receiver_config_packets: u64,
+    receiver_keyframes: u64,
+    receiver_last_sequence: u32,
+    receiver_queue_depth: u32,
+    receiver_stream_width: i32,
+    receiver_stream_height: i32,
+    receiver_stream_fps: i32,
+    receiver_last_error: i32,
+    receiver_receive_mbps: f64,
+    receiver_input_fps: f64,
+    receiver_render_fps: f64,
+    receiver_drop_fps: f64,
+    receiver_max_receive_gap_ms: f64,
+    receiver_max_input_gap_ms: f64,
+    receiver_max_render_gap_ms: f64,
     elapsed_seconds: f64,
     last_error: String,
 }
@@ -121,6 +163,34 @@ impl Default for StreamStats {
             max_packet_send_ms: 0.0,
             sender_queue_depth: 0,
             host_dropped_packets: 0,
+            resync_events: 0,
+            resync_dropped_access_units: 0,
+            bottleneck: "idle".to_string(),
+            effective_capture_backend: String::new(),
+            receiver_running: false,
+            receiver_decoder_started: false,
+            receiver_surface_ready: false,
+            receiver_packets: 0,
+            receiver_bytes: 0,
+            receiver_queued_inputs: 0,
+            receiver_rendered_outputs: 0,
+            receiver_dropped_packets: 0,
+            receiver_sequence_gaps: 0,
+            receiver_config_packets: 0,
+            receiver_keyframes: 0,
+            receiver_last_sequence: 0,
+            receiver_queue_depth: 0,
+            receiver_stream_width: 0,
+            receiver_stream_height: 0,
+            receiver_stream_fps: 0,
+            receiver_last_error: 0,
+            receiver_receive_mbps: 0.0,
+            receiver_input_fps: 0.0,
+            receiver_render_fps: 0.0,
+            receiver_drop_fps: 0.0,
+            receiver_max_receive_gap_ms: 0.0,
+            receiver_max_input_gap_ms: 0.0,
+            receiver_max_render_gap_ms: 0.0,
             elapsed_seconds: 0.0,
             last_error: String::new(),
         }
@@ -195,7 +265,8 @@ fn start_stream(
         .ok_or_else(|| format!("display {} not found", config.display_id))?;
 
     let encoder = choose_encoder(&config.ffmpeg_path, &config.encoder)?;
-    let command = build_ffmpeg_command(&config, &display, &encoder);
+    let config = effective_stream_config(config, &display, &encoder);
+    let command = build_ffmpeg_command(&config, &display, &encoder)?;
     let stop = Arc::new(AtomicBool::new(false));
     let child_slot = Arc::new(Mutex::new(None));
 
@@ -208,6 +279,7 @@ fn start_stream(
             running: true,
             status: format!("starting {}", encoder),
             encoder: encoder.clone(),
+            effective_capture_backend: config.capture_backend.clone(),
             ffmpeg_command: quote_command(&command),
             ..StreamStats::default()
         };
@@ -223,6 +295,7 @@ fn start_stream(
             stop_for_thread,
             child_for_thread,
             config,
+            display,
             command,
             encoder,
         );
@@ -315,14 +388,21 @@ fn enumerate_displays() -> Result<Vec<DisplayInfo>, String> {
                 .position(|ch| *ch == 0)
                 .unwrap_or(info.szDevice.len());
             let name = String::from_utf16_lossy(&info.szDevice[..end]);
+            let device_string = display_device_string(&name);
             displays.push(DisplayInfo {
                 id: displays.len(),
                 name,
+                virtual_display: is_likely_virtual_display(&device_string),
+                device_string,
                 left: rect.left,
                 top: rect.top,
                 width: rect.right - rect.left,
                 height: rect.bottom - rect.top,
                 primary: info.monitorInfo.dwFlags & 1 == 1,
+                hmonitor: monitor.0 as u64,
+                dxgi_adapter_idx: None,
+                dxgi_output_idx: None,
+                dxgi_adapter_name: String::new(),
             });
         }
         BOOL(1)
@@ -340,7 +420,161 @@ fn enumerate_displays() -> Result<Vec<DisplayInfo>, String> {
     if !ok.as_bool() {
         return Err("EnumDisplayMonitors failed".to_string());
     }
+    attach_dxgi_outputs(&mut displays);
     Ok(displays)
+}
+
+#[derive(Clone)]
+struct DxgiOutputInfo {
+    adapter_idx: u32,
+    output_idx: u32,
+    device_name: String,
+    adapter_name: String,
+    left: i32,
+    top: i32,
+    width: i32,
+    height: i32,
+}
+
+fn attach_dxgi_outputs(displays: &mut [DisplayInfo]) {
+    let outputs = enumerate_dxgi_outputs();
+    for display in displays {
+        if let Some(output) = outputs
+            .iter()
+            .find(|output| dxgi_output_matches(display, output))
+        {
+            display.dxgi_adapter_idx = Some(output.adapter_idx);
+            display.dxgi_output_idx = Some(output.output_idx);
+            display.dxgi_adapter_name = output.adapter_name.clone();
+        }
+    }
+}
+
+fn enumerate_dxgi_outputs() -> Vec<DxgiOutputInfo> {
+    let Ok(factory) = (unsafe { CreateDXGIFactory1::<IDXGIFactory1>() }) else {
+        return Vec::new();
+    };
+    let mut outputs = Vec::new();
+    for adapter_idx in 0..32 {
+        let Ok(adapter) = (unsafe { factory.EnumAdapters1(adapter_idx) }) else {
+            break;
+        };
+        outputs.extend(enumerate_adapter_outputs(adapter_idx, &adapter));
+    }
+    outputs
+}
+
+fn enumerate_adapter_outputs(adapter_idx: u32, adapter: &IDXGIAdapter1) -> Vec<DxgiOutputInfo> {
+    let adapter_name = unsafe { adapter.GetDesc1() }
+        .map(|desc| utf16_field_to_string(&desc.Description))
+        .unwrap_or_default();
+    let mut outputs = Vec::new();
+    for output_idx in 0..32 {
+        let Ok(output) = (unsafe { adapter.EnumOutputs(output_idx) }) else {
+            break;
+        };
+        let Ok(desc) = (unsafe { output.GetDesc() }) else {
+            continue;
+        };
+        let rect = desc.DesktopCoordinates;
+        outputs.push(DxgiOutputInfo {
+            adapter_idx,
+            output_idx,
+            device_name: utf16_field_to_string(&desc.DeviceName),
+            adapter_name: adapter_name.clone(),
+            left: rect.left,
+            top: rect.top,
+            width: rect.right - rect.left,
+            height: rect.bottom - rect.top,
+        });
+    }
+    outputs
+}
+
+fn dxgi_output_matches(display: &DisplayInfo, output: &DxgiOutputInfo) -> bool {
+    if display.name == output.device_name {
+        return true;
+    }
+    display.left == output.left
+        && display.top == output.top
+        && display.width == output.width
+        && display.height == output.height
+}
+
+fn display_device_string(device_name: &str) -> String {
+    [
+        display_adapter_string(device_name),
+        display_monitor_string(device_name),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|part| !part.trim().is_empty())
+    .collect::<Vec<_>>()
+    .join(" / ")
+}
+
+fn display_adapter_string(device_name: &str) -> Option<String> {
+    for index in 0..32 {
+        let mut device = DISPLAY_DEVICEW::default();
+        device.cb = size_of::<DISPLAY_DEVICEW>() as u32;
+        let ok = unsafe { EnumDisplayDevicesW(PCWSTR::null(), index, &mut device, 0) };
+        if !ok.as_bool() {
+            break;
+        }
+
+        let adapter_name = utf16_field_to_string(&device.DeviceName);
+        if adapter_name == device_name {
+            return Some(display_device_description(&device));
+        }
+    }
+    None
+}
+
+fn display_monitor_string(device_name: &str) -> Option<String> {
+    let mut wide_name = device_name.encode_utf16().collect::<Vec<_>>();
+    wide_name.push(0);
+
+    let mut device = DISPLAY_DEVICEW::default();
+    device.cb = size_of::<DISPLAY_DEVICEW>() as u32;
+    let ok = unsafe { EnumDisplayDevicesW(PCWSTR(wide_name.as_ptr()), 0, &mut device, 0) };
+    if !ok.as_bool() {
+        return None;
+    }
+
+    Some(display_device_description(&device))
+}
+
+fn display_device_description(device: &DISPLAY_DEVICEW) -> String {
+    [
+        utf16_field_to_string(&device.DeviceString),
+        utf16_field_to_string(&device.DeviceID),
+        utf16_field_to_string(&device.DeviceKey),
+    ]
+    .into_iter()
+    .filter(|part| !part.trim().is_empty())
+    .collect::<Vec<_>>()
+    .join(" ")
+}
+
+fn utf16_field_to_string(field: &[u16]) -> String {
+    let end = field.iter().position(|ch| *ch == 0).unwrap_or(field.len());
+    String::from_utf16_lossy(&field[..end])
+}
+
+fn is_likely_virtual_display(device_string: &str) -> bool {
+    let lower = device_string.to_ascii_lowercase();
+    [
+        "parsec",
+        "virtual",
+        "vdisplay",
+        "indirect",
+        "idd",
+        "spacedesk",
+        "mirage",
+        "usb display",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 fn available_encoders(ffmpeg: &str) -> Result<String, String> {
@@ -406,6 +640,80 @@ fn parse_size_to_kbits(size: &str) -> u32 {
     }
 }
 
+fn effective_stream_config(
+    mut config: StreamConfig,
+    display: &DisplayInfo,
+    encoder: &str,
+) -> StreamConfig {
+    config = apply_native_target_profile(config, encoder);
+    let max_recovery_gop = recovery_gop_for_resolution(&config, display);
+    if config.gop > max_recovery_gop {
+        config.gop = max_recovery_gop;
+    }
+    if display.virtual_display {
+        if config.fps > 60 {
+            config.fps = 60;
+        }
+    }
+    config
+}
+
+fn apply_native_target_profile(mut config: StreamConfig, encoder: &str) -> StreamConfig {
+    if config.scale.trim() != NATIVE_TARGET_SCALE {
+        return config;
+    }
+
+    match encoder {
+        "hevc_nvenc" if config.encoder == "auto" || looks_like_native_default_profile(&config) => {
+            config.fps = 60;
+            config.bitrate = NATIVE_TARGET_BITRATE.to_string();
+            config.bufsize = NATIVE_TARGET_BUFSIZE.to_string();
+            config.gop = NATIVE_TARGET_GOP_60;
+        }
+        "hevc_qsv" if config.encoder == "auto" || looks_like_native_default_profile(&config) => {
+            config.fps = 60;
+            config.bitrate = NATIVE_TARGET_BITRATE.to_string();
+            config.bufsize = NATIVE_TARGET_BUFSIZE.to_string();
+            config.gop = NATIVE_TARGET_GOP_60;
+        }
+        "libx265" if config.encoder == "auto" || looks_like_native_default_profile(&config) => {
+            config.fps = 60;
+            config.bitrate = NATIVE_TARGET_BITRATE.to_string();
+            config.bufsize = NATIVE_TARGET_BUFSIZE.to_string();
+            config.gop = NATIVE_TARGET_GOP_60;
+        }
+        _ => {}
+    }
+    config
+}
+
+fn looks_like_native_default_profile(config: &StreamConfig) -> bool {
+    config.scale.trim() == NATIVE_TARGET_SCALE
+        && config.fps == 60
+        && config.gop == NATIVE_TARGET_GOP_60
+        && matches!(
+            config.bitrate.trim().to_ascii_uppercase().as_str(),
+            "35M" | "55M" | "70M" | "80M"
+        )
+}
+
+fn recovery_gop_for_resolution(config: &StreamConfig, display: &DisplayInfo) -> u32 {
+    let (width, height) = requested_output_dimensions(config, display);
+    let pixels = width.saturating_mul(height);
+    let fps = config.fps.max(1);
+    if pixels <= 2800 * 1840 {
+        fps.saturating_add(3) / 4
+    } else {
+        fps.saturating_add(2) / 3
+    }
+    .max(1)
+}
+
+fn requested_output_dimensions(config: &StreamConfig, display: &DisplayInfo) -> (u32, u32) {
+    parse_scale(&config.scale)
+        .unwrap_or_else(|| (display.width.max(1) as u32, display.height.max(1) as u32))
+}
+
 fn quote_command(command: &[String]) -> String {
     command
         .iter()
@@ -428,12 +736,9 @@ fn is_dxgi_capture(capture_backend: &str) -> bool {
 }
 
 fn use_gpu_resident_dxgi(config: &StreamConfig, encoder: &str) -> bool {
-    if encoder != "hevc_nvenc" {
-        return false;
-    }
     match config.capture_backend.as_str() {
-        "ddagrab_zero_copy" => true,
-        "ddagrab" => encoder == "hevc_nvenc",
+        "ddagrab_zero_copy" => matches!(encoder, "hevc_nvenc" | "hevc_qsv"),
+        "ddagrab" => matches!(encoder, "hevc_nvenc" | "hevc_qsv"),
         _ => false,
     }
 }
@@ -446,11 +751,46 @@ fn parse_scale(scale: &str) -> Option<(u32, u32)> {
     (width > 0 && height > 0).then_some((width, height))
 }
 
+fn ddagrab_device(display: &DisplayInfo) -> Result<(u32, u32), String> {
+    let adapter_idx = display.dxgi_adapter_idx.ok_or_else(|| {
+        format!(
+            "selected display {} ({}, {}x{} at {},{}) is not mapped to a DXGI adapter; try GDI fallback or reconnect the display",
+            display.id,
+            display.name,
+            display.width,
+            display.height,
+            display.left,
+            display.top
+        )
+    })?;
+    let output_idx = display.dxgi_output_idx.ok_or_else(|| {
+        format!(
+            "selected display {} ({}, {}x{} at {},{}) is not mapped to a DXGI output; try GDI fallback or reconnect the display",
+            display.id,
+            display.name,
+            display.width,
+            display.height,
+            display.left,
+            display.top
+        )
+    })?;
+    Ok((adapter_idx, output_idx))
+}
+
+fn ddagrab_input(config: &StreamConfig, display: &DisplayInfo) -> Result<String, String> {
+    let (_, output_idx) = ddagrab_device(display)?;
+    Ok(format!(
+        "ddagrab=output_idx={}:framerate={}:draw_mouse=1:dup_frames=1:video_size={}x{}:output_fmt=bgra:allow_fallback=1",
+        output_idx, config.fps, display.width, display.height
+    ))
+}
+
 fn build_ffmpeg_command(
     config: &StreamConfig,
     display: &DisplayInfo,
     encoder: &str,
-) -> Vec<String> {
+) -> Result<Vec<String>, String> {
+    let capture_backend = config.capture_backend.clone();
     let mut command = vec![
         config.ffmpeg_path.clone(),
         "-hide_banner".into(),
@@ -466,7 +806,7 @@ fn build_ffmpeg_command(
         "low_delay".into(),
     ];
 
-    match config.capture_backend.as_str() {
+    match capture_backend.as_str() {
         "gdigrab" => command.extend([
             "-f".into(),
             "gdigrab".into(),
@@ -488,40 +828,58 @@ fn build_ffmpeg_command(
             "lavfi".into(),
             "-i".into(),
             format!(
-                "gfxcapture=monitor_idx={}:max_framerate={}:capture_cursor=1:display_border=0:width={}:height={}:output_fmt=bgra",
-                display.id, config.fps, display.width, display.height
+                "gfxcapture=hmonitor={}:max_framerate={}:capture_cursor=1:display_border=0:width={}:height={}:output_fmt=bgra",
+                display.hmonitor, config.fps, display.width, display.height
             ),
         ]),
-        _ if is_dxgi_capture(&config.capture_backend) => command.extend([
-            "-f".into(),
-            "lavfi".into(),
-            "-i".into(),
-            format!(
-                "ddagrab=output_idx={}:framerate={}:draw_mouse=1:dup_frames=1:video_size={}x{}:output_fmt=bgra:allow_fallback=1",
-                display.id, config.fps, display.width, display.height
-            ),
-        ]),
+        _ if is_dxgi_capture(&capture_backend) => {
+            let (adapter_idx, _) = ddagrab_device(display)?;
+            command.extend([
+                "-init_hw_device".into(),
+                format!("d3d11va=t2s_dda:{}", adapter_idx),
+            ]);
+            if encoder == "hevc_qsv" {
+                command.extend([
+                    "-init_hw_device".into(),
+                    "qsv=t2s_qsv@t2s_dda".into(),
+                ]);
+            }
+            command.extend([
+                "-filter_hw_device".into(),
+                "t2s_dda".into(),
+                "-f".into(),
+                "lavfi".into(),
+                "-i".into(),
+                ddagrab_input(config, display)?,
+            ]);
+        }
         _ => command.extend([
             "-f".into(),
             "lavfi".into(),
             "-i".into(),
-            format!(
-                "ddagrab=output_idx={}:framerate={}:draw_mouse=1:dup_frames=1:video_size={}x{}:output_fmt=bgra:allow_fallback=1",
-                display.id, config.fps, display.width, display.height
-            ),
+            ddagrab_input(config, display)?,
         ]),
     }
 
     let mut filters = Vec::new();
-    let gpu_resident_dxgi = use_gpu_resident_dxgi(config, encoder);
-    if gpu_resident_dxgi {
+    let mut effective_config = config.clone();
+    effective_config.capture_backend = capture_backend.clone();
+    let gpu_resident_dxgi = use_gpu_resident_dxgi(&effective_config, encoder);
+    if gpu_resident_dxgi && encoder == "hevc_qsv" {
+        filters.push("hwmap=derive_device=qsv".to_string());
+        if let Some((width, height)) = parse_scale(&config.scale) {
+            filters.push(format!("scale_qsv=w={}:h={}:format=nv12", width, height));
+        } else {
+            filters.push("scale_qsv=format=nv12".to_string());
+        }
+    } else if gpu_resident_dxgi {
         if let Some((width, height)) = parse_scale(&config.scale) {
             filters.push(format!(
                 "scale_d3d11=width={}:height={}:format=bgra",
                 width, height
             ));
         }
-    } else if config.capture_backend != "gdigrab" {
+    } else if capture_backend != "gdigrab" {
         filters.push("hwdownload".to_string());
         filters.push("format=bgra".to_string());
         if !config.scale.trim().is_empty() {
@@ -557,6 +915,8 @@ fn build_ffmpeg_command(
             "1".into(),
             "-rc".into(),
             "cbr".into(),
+            "-strict_gop".into(),
+            "1".into(),
             "-b:v".into(),
             config.bitrate.clone(),
             "-maxrate".into(),
@@ -623,13 +983,17 @@ fn build_ffmpeg_command(
 
     command.extend([
         "-an".into(),
+        "-fps_mode".into(),
+        "cfr".into(),
+        "-r".into(),
+        config.fps.to_string(),
         "-flush_packets".into(),
         "1".into(),
         "-f".into(),
         "hevc".into(),
         "pipe:1".into(),
     ]);
-    command
+    Ok(command)
 }
 
 fn stream_thread(
@@ -638,6 +1002,7 @@ fn stream_thread(
     stop: Arc<AtomicBool>,
     child_slot: Arc<Mutex<Option<Child>>>,
     config: StreamConfig,
+    display: DisplayInfo,
     command: Vec<String>,
     encoder: String,
 ) {
@@ -647,6 +1012,7 @@ fn stream_thread(
         &stop,
         &child_slot,
         &config,
+        &display,
         &command,
         &encoder,
     );
@@ -670,6 +1036,7 @@ fn run_stream_loop(
     stop: &Arc<AtomicBool>,
     child_slot: &Arc<Mutex<Option<Child>>>,
     config: &StreamConfig,
+    display: &DisplayInfo,
     command: &[String],
     encoder: &str,
 ) -> Result<(), String> {
@@ -713,18 +1080,67 @@ fn run_stream_loop(
     stream
         .set_write_timeout(None)
         .map_err(|err| format!("clear TCP write timeout failed: {}", err))?;
+    let mut receiver_stats_stream = stream
+        .try_clone()
+        .map_err(|err| format!("clone TCP stream for receiver stats failed: {}", err))?;
+    receiver_stats_stream
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .map_err(|err| format!("set receiver stats read timeout failed: {}", err))?;
+    let receiver_metrics = Arc::new(Mutex::new(ReceiverMetrics::default()));
+    let receiver_stats_handle = {
+        let metrics = receiver_metrics.clone();
+        let stop = stop.clone();
+        thread::spawn(move || receiver_stats_loop(&mut receiver_stats_stream, metrics, stop))
+    };
 
     update_status(state, app, true, "starting ffmpeg", encoder, "");
     let mut child = hidden_command(&command[0])
         .args(&command[1..])
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|err| format!("ffmpeg start failed: {}", err))?;
-    let mut stdout = child
+    let stdout = child
         .stdout
         .take()
         .ok_or_else(|| "ffmpeg stdout unavailable".to_string())?;
+    let (stdout_tx, stdout_rx) = mpsc::channel::<Result<Vec<u8>, String>>();
+    let stdout_reader_handle = thread::spawn(move || {
+        let mut stdout = stdout;
+        let mut read_buffer = [0u8; 256 * 1024];
+        loop {
+            match stdout.read(&mut read_buffer) {
+                Ok(0) => break,
+                Ok(read) => {
+                    if stdout_tx.send(Ok(read_buffer[..read].to_vec())).is_err() {
+                        break;
+                    }
+                }
+                Err(err) => {
+                    let _ = stdout_tx.send(Err(format!("ffmpeg read failed: {}", err)));
+                    break;
+                }
+            }
+        }
+    });
+    let stderr_tail = Arc::new(Mutex::new(String::new()));
+    let stderr_handle = child.stderr.take().map(|stderr| {
+        let stderr_tail = stderr_tail.clone();
+        thread::spawn(move || {
+            let reader = BufReader::new(stderr);
+            for line in reader.lines().map_while(Result::ok) {
+                if let Ok(mut tail) = stderr_tail.lock() {
+                    tail.push_str(&line);
+                    tail.push('\n');
+                    if tail.len() > 8192 {
+                        while tail.len() > 8192 {
+                            tail.remove(0);
+                        }
+                    }
+                }
+            }
+        })
+    });
     {
         let mut guard = child_slot
             .lock()
@@ -740,6 +1156,8 @@ fn run_stream_loop(
     let mut max_packet_bytes = 0u64;
     let mut max_keyframe_bytes = 0u64;
     let mut max_delta_frame_bytes = 0u64;
+    let mut resync_events = 0u64;
+    let mut resync_dropped_access_units = 0u64;
     let mut ffmpeg_reads = 0u64;
     let mut ffmpeg_read_bytes = 0u64;
     let mut max_read_gap_ms = 0.0;
@@ -756,49 +1174,71 @@ fn run_stream_loop(
     };
     let mut last_sent_vcl_packets = 0u64;
     let mut last_sent_bytes = 0u64;
+    let mut last_socket_write_blocked_events = 0u64;
+    let mut last_socket_write_blocked_ms = 0.0;
     let mut access_unit_parser = HevcAccessUnitParser::default();
-    let mut read_buffer = [0u8; 256 * 1024];
+    let frame_duration_us = 1_000_000u64 / config.fps.max(1) as u64;
+    let mut video_frame_index = 0u64;
+    let idle_flush_interval =
+        Duration::from_millis((2000u64 / config.fps.max(1) as u64).clamp(50, 200));
+    let stats_interval = Duration::from_millis(500);
     let mut log_file = open_stream_log();
     write_stream_log(
         &mut log_file,
         &format!(
-            "START encoder={} bitrate={} bufsize={} gop={} fps={} capture={} scale={} pacing={} command={}",
+            "START encoder={} bitrate={} bufsize={} gop={} fps={} capture={} display={} device=\"{}\" virtual={} dxgi_adapter={:?} dxgi_output={:?} dxgi_adapter_name=\"{}\" scale={} pacing={} command={}",
             encoder,
             config.bitrate,
             config.bufsize,
             config.gop,
             config.fps,
             config.capture_backend,
+            display.name,
+            display.device_string,
+            display.virtual_display,
+            display.dxgi_adapter_idx,
+            display.dxgi_output_idx,
+            display.dxgi_adapter_name,
             config.scale,
             config.send_pacing,
             quote_command(command)
         ),
     );
 
+    let mut ffmpeg_stdout_eof = false;
     while !stop.load(Ordering::SeqCst) {
-        let read = stdout
-            .read(&mut read_buffer)
-            .map_err(|err| format!("ffmpeg read failed: {}", err))?;
-        if read == 0 {
-            break;
-        }
-        let now = Instant::now();
-        if let Some(previous_read) = last_read {
-            let read_gap_ms = now.duration_since(previous_read).as_secs_f64() * 1000.0;
-            max_read_gap_ms = f64::max(max_read_gap_ms, read_gap_ms);
-        }
-        last_read = Some(now);
-        ffmpeg_reads += 1;
-        ffmpeg_read_bytes += read as u64;
-
-        let packets_to_send = access_unit_parser.push(&read_buffer[..read]);
+        let packets_to_send = match stdout_rx.recv_timeout(idle_flush_interval) {
+            Ok(Ok(chunk)) => {
+                let now = Instant::now();
+                if let Some(previous_read) = last_read {
+                    let read_gap_ms = now.duration_since(previous_read).as_secs_f64() * 1000.0;
+                    max_read_gap_ms = f64::max(max_read_gap_ms, read_gap_ms);
+                }
+                last_read = Some(now);
+                ffmpeg_reads += 1;
+                ffmpeg_read_bytes += chunk.len() as u64;
+                access_unit_parser.push(&chunk)
+            }
+            Ok(Err(error)) => return Err(error),
+            Err(mpsc::RecvTimeoutError::Timeout) => access_unit_parser.flush_idle(),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                ffmpeg_stdout_eof = true;
+                let packets = access_unit_parser.flush_idle();
+                if packets.is_empty() {
+                    break;
+                }
+                packets
+            }
+        };
 
         for packet in packets_to_send {
             let packet_bytes = packet.payload.len() as u64;
             let is_keyframe = packet.flags & protocol::FLAG_KEYFRAME != 0;
             let mut packet = packet;
             packet.sequence = seq;
-            packet.timestamp_us = start.elapsed().as_micros() as u64;
+            // Keep decoder PTS dense even if capture/encode emits nothing while the desktop is static.
+            packet.timestamp_us = video_timestamp_us(video_frame_index, frame_duration_us);
+            video_frame_index = video_frame_index.saturating_add(1);
             seq = seq.wrapping_add(1);
             window_max_packet_bytes = window_max_packet_bytes.max(packet_bytes);
             max_packet_bytes = max_packet_bytes.max(packet_bytes);
@@ -807,13 +1247,32 @@ fn run_stream_loop(
             } else if packet.flags & protocol::FLAG_VCL != 0 {
                 max_delta_frame_bytes = max_delta_frame_bytes.max(packet_bytes);
             }
-            sender_queue.push(packet);
+            match sender_queue.push(packet) {
+                QueuePushResult::Queued => {}
+                QueuePushResult::Full(packet) => {
+                    resync_events += 1;
+                    match sender_queue.push_realtime(packet) {
+                        QueueRealtimePushResult::Queued { dropped } => {
+                            resync_dropped_access_units += dropped;
+                        }
+                        QueueRealtimePushResult::DroppedIncoming => {
+                            resync_dropped_access_units += 1;
+                        }
+                        QueueRealtimePushResult::Closed => break,
+                    }
+                }
+                QueuePushResult::Closed => break,
+            }
         }
 
-        if last_emit.elapsed() >= Duration::from_millis(500) {
+        if last_emit.elapsed() >= stats_interval {
             let elapsed = start.elapsed().as_secs_f64().max(0.001);
             let window_elapsed = last_emit.elapsed().as_secs_f64().max(0.001);
             let sender = sender_metrics
+                .lock()
+                .map(|guard| guard.clone())
+                .unwrap_or_default();
+            let receiver = receiver_metrics
                 .lock()
                 .map(|guard| guard.clone())
                 .unwrap_or_default();
@@ -822,6 +1281,11 @@ fn run_stream_loop(
                 .sent_vcl_packets
                 .saturating_sub(last_sent_vcl_packets);
             let window_bytes = sender.sent_bytes.saturating_sub(last_sent_bytes);
+            let window_socket_write_blocked_events = sender
+                .socket_write_blocked_events
+                .saturating_sub(last_socket_write_blocked_events);
+            let window_socket_write_blocked_ms =
+                (sender.socket_write_blocked_ms - last_socket_write_blocked_ms).max(0.0);
             let mut guard = state
                 .lock()
                 .map_err(|_| "state lock poisoned".to_string())?;
@@ -844,16 +1308,23 @@ fn run_stream_loop(
             guard.stats.ffmpeg_read_bytes = ffmpeg_read_bytes;
             guard.stats.parser_buffer_bytes = access_unit_parser.buffer_len() as u64;
             guard.stats.max_read_gap_ms = max_read_gap_ms;
-            guard.stats.socket_write_blocked_events = sender.socket_write_blocked_events;
-            guard.stats.socket_write_blocked_ms = sender.socket_write_blocked_ms;
+            guard.stats.socket_write_blocked_events = window_socket_write_blocked_events;
+            guard.stats.socket_write_blocked_ms = window_socket_write_blocked_ms;
             guard.stats.max_socket_write_ms = sender.max_socket_write_ms;
             guard.stats.paced_packets = sender.paced_packets;
             guard.stats.paced_sleep_ms = sender.paced_sleep_ms;
             guard.stats.max_packet_send_ms = sender.max_packet_send_ms;
             guard.stats.sender_queue_depth = queue_depth;
             guard.stats.host_dropped_packets = host_dropped_packets;
+            guard.stats.resync_events = resync_events;
+            guard.stats.resync_dropped_access_units = resync_dropped_access_units;
+            guard.stats.effective_capture_backend = config.capture_backend.clone();
+            apply_receiver_metrics(&mut guard.stats, &receiver);
+            guard.stats.bottleneck = classify_bottleneck(&guard.stats, config);
             if !sender.last_error.is_empty() {
                 guard.stats.last_error = sender.last_error.clone();
+            } else if !receiver.last_error.is_empty() {
+                guard.stats.last_error = receiver.last_error.clone();
             }
             guard.stats.elapsed_seconds = elapsed;
             let stats = guard.stats.clone();
@@ -862,18 +1333,51 @@ fn run_stream_loop(
             last_emit = Instant::now();
             last_sent_vcl_packets = sender.sent_vcl_packets;
             last_sent_bytes = sender.sent_bytes;
+            last_socket_write_blocked_events = sender.socket_write_blocked_events;
+            last_socket_write_blocked_ms = sender.socket_write_blocked_ms;
             window_max_packet_bytes = 0;
         }
     }
     sender_queue.close();
     let _ = sender_handle.join();
+    stop.store(true, Ordering::SeqCst);
+    let _ = receiver_stats_handle.join();
 
+    let mut ffmpeg_status_error = None;
     if let Ok(mut guard) = child_slot.lock() {
-        if let Some(child) = guard.as_mut() {
-            let _ = child.kill();
-            let _ = child.wait();
+        if let Some(mut child) = guard.take() {
+            if stop.load(Ordering::SeqCst) {
+                let _ = child.kill();
+                let _ = child.wait();
+            } else if ffmpeg_stdout_eof {
+                match child.wait() {
+                    Ok(status) if status.success() => {}
+                    Ok(status) => {
+                        ffmpeg_status_error = Some(format!("ffmpeg exited with {}", status));
+                    }
+                    Err(err) => {
+                        ffmpeg_status_error = Some(format!("ffmpeg wait failed: {}", err));
+                    }
+                }
+            } else {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
         }
-        *guard = None;
+    }
+    if let Some(handle) = stderr_handle {
+        let _ = handle.join();
+    }
+    let _ = stdout_reader_handle.join();
+    if let Some(error) = ffmpeg_status_error {
+        let tail = stderr_tail
+            .lock()
+            .map(|tail| tail.trim().to_string())
+            .unwrap_or_default();
+        if tail.is_empty() {
+            return Err(error);
+        }
+        return Err(format!("{}. Recent ffmpeg stderr:\n{}", error, tail));
     }
     Ok(())
 }
@@ -986,8 +1490,9 @@ fn write_stats_log(log_file: &mut Option<std::fs::File>, stats: &StreamStats) {
     write_stream_log(
         log_file,
         &format!(
-            "STAT elapsed={:.3} fps={:.2} mbps={:.2} current_fps={:.2} current_mbps={:.2} packets={} vcl={} keyframes={} max_packet={} window_max_packet={} max_keyframe={} max_delta={} reads={} read_bytes={} parser_buffer={} max_read_gap_ms={:.1} socket_stalls={} socket_stall_ms={:.1} max_socket_ms={:.1} paced={} paced_sleep_ms={:.1} max_send_ms={:.1} queue={} host_dropped={}",
+            "STAT elapsed={:.3} bottleneck=\"{}\" host_fps={:.2} host_mbps={:.2} host_current_fps={:.2} host_current_mbps={:.2} host_packets={} host_vcl={} host_keyframes={} max_packet={} window_max_packet={} max_keyframe={} max_delta={} ffmpeg_reads={} ffmpeg_read_bytes={} parser_buffer={} host_max_read_gap_ms={:.1} socket_stalls={} socket_stall_ms={:.1} max_socket_ms={:.1} paced={} paced_sleep_ms={:.1} max_send_ms={:.1} host_queue={} host_dropped={} resync_events={} resync_dropped={} capture={} receiver_running={} receiver_surface={} receiver_decoder={} receiver_packets={} receiver_bytes={} receiver_mbps={:.2} receiver_inputs={} receiver_input_fps={:.2} receiver_rendered={} receiver_render_fps={:.2} receiver_dropped={} receiver_drop_fps={:.2} receiver_queue={} receiver_seq_gaps={} receiver_config={} receiver_keyframes={} receiver_stream={}x{}@{} receiver_max_rx_gap_ms={:.1} receiver_max_input_gap_ms={:.1} receiver_max_render_gap_ms={:.1} receiver_last_error={}",
             stats.elapsed_seconds,
+            stats.bottleneck,
             stats.fps,
             stats.mbps,
             stats.current_fps,
@@ -1010,9 +1515,74 @@ fn write_stats_log(log_file: &mut Option<std::fs::File>, stats: &StreamStats) {
             stats.paced_sleep_ms,
             stats.max_packet_send_ms,
             stats.sender_queue_depth,
-            stats.host_dropped_packets
+            stats.host_dropped_packets,
+            stats.resync_events,
+            stats.resync_dropped_access_units,
+            stats.effective_capture_backend,
+            stats.receiver_running,
+            stats.receiver_surface_ready,
+            stats.receiver_decoder_started,
+            stats.receiver_packets,
+            stats.receiver_bytes,
+            stats.receiver_receive_mbps,
+            stats.receiver_queued_inputs,
+            stats.receiver_input_fps,
+            stats.receiver_rendered_outputs,
+            stats.receiver_render_fps,
+            stats.receiver_dropped_packets,
+            stats.receiver_drop_fps,
+            stats.receiver_queue_depth,
+            stats.receiver_sequence_gaps,
+            stats.receiver_config_packets,
+            stats.receiver_keyframes,
+            stats.receiver_stream_width,
+            stats.receiver_stream_height,
+            stats.receiver_stream_fps,
+            stats.receiver_max_receive_gap_ms,
+            stats.receiver_max_input_gap_ms,
+            stats.receiver_max_render_gap_ms,
+            stats.receiver_last_error
         ),
     );
+}
+
+fn classify_bottleneck(stats: &StreamStats, config: &StreamConfig) -> String {
+    let frame_ms = 1000.0 / config.fps.max(1) as f64;
+    let receiver_has_stats = stats.receiver_packets > 0 || stats.receiver_rendered_outputs > 0;
+
+    if stats.socket_write_blocked_events > 0
+        && (stats.max_socket_write_ms > frame_ms * 2.0 || stats.sender_queue_depth > 0)
+    {
+        return "transport backpressure: TCP/HDC write is slower than encoder output".to_string();
+    }
+    if stats.host_dropped_packets > 0 || stats.resync_events > 0 {
+        return "host queue overflow: sender fell behind and had to resync".to_string();
+    }
+    if stats.max_read_gap_ms > frame_ms * 3.0 && stats.current_fps < config.fps as f64 * 0.85 {
+        return "capture/encoder jitter: FFmpeg output has long frame gaps".to_string();
+    }
+    if receiver_has_stats
+        && stats.receiver_receive_mbps < stats.current_mbps * 0.75
+        && stats.current_mbps > 1.0
+    {
+        return "receiver transport: tablet receive rate trails host send rate".to_string();
+    }
+    if receiver_has_stats
+        && stats.receiver_input_fps < stats.current_fps * 0.75
+        && stats.current_fps > 5.0
+    {
+        return "tablet decoder input: receiver is not feeding frames fast enough".to_string();
+    }
+    if receiver_has_stats
+        && stats.receiver_render_fps < stats.receiver_input_fps * 0.75
+        && stats.receiver_input_fps > 5.0
+    {
+        return "tablet render/decode: outputs are slower than decoder inputs".to_string();
+    }
+    if stats.receiver_sequence_gaps > 0 || stats.receiver_dropped_packets > 0 {
+        return "receiver recovery: packet gaps or stale frames reached tablet".to_string();
+    }
+    "no obvious bottleneck in current sample".to_string()
 }
 
 fn timestamp_seconds() -> f64 {
@@ -1110,7 +1680,7 @@ fn send_packet(
     timestamp_us: u64,
     flags: u16,
     payload: &[u8],
-    pacer: &SendPacer,
+    pacer: &mut SendPacer,
 ) -> Result<SendReport, String> {
     if !pacer.enabled {
         protocol::write_message_parts(
@@ -1136,12 +1706,12 @@ fn send_packet(
         .write_all(&header)
         .map_err(|err| format!("socket header write failed: {}", err))?;
 
-    let started = Instant::now();
-    let mut sent = 0usize;
     let mut report = SendReport {
         paced: true,
         ..SendReport::default()
     };
+    let started = Instant::now();
+    let mut sent = 0usize;
 
     for chunk in payload.chunks(pacer.chunk_bytes) {
         stream
@@ -1149,12 +1719,7 @@ fn send_packet(
             .map_err(|err| format!("socket payload write failed: {}", err))?;
         sent += chunk.len();
 
-        if sent <= pacer.burst_bytes {
-            continue;
-        }
-
-        let paced_bytes = sent - pacer.burst_bytes;
-        let target_elapsed = Duration::from_secs_f64(paced_bytes as f64 / pacer.bytes_per_second);
+        let target_elapsed = pacer.target_delay_for_sent(sent);
         let actual_elapsed = started.elapsed();
         if target_elapsed > actual_elapsed {
             let sleep_for = target_elapsed - actual_elapsed;
@@ -1166,12 +1731,364 @@ fn send_packet(
     Ok(report)
 }
 
-#[derive(Clone, Copy)]
+fn video_timestamp_us(frame_index: u64, frame_duration_us: u64) -> u64 {
+    frame_index.saturating_mul(frame_duration_us)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config() -> StreamConfig {
+        StreamConfig {
+            hdc_path: "hdc".to_string(),
+            ffmpeg_path: "ffmpeg".to_string(),
+            encoder: "hevc_nvenc".to_string(),
+            capture_backend: "ddagrab".to_string(),
+            display_id: 1,
+            fps: 60,
+            bitrate: NATIVE_TARGET_BITRATE.to_string(),
+            bufsize: NATIVE_TARGET_BUFSIZE.to_string(),
+            gop: NATIVE_TARGET_GOP_60,
+            scale: NATIVE_TARGET_SCALE.to_string(),
+            send_pacing: true,
+            host: "127.0.0.1".to_string(),
+            port: 5000,
+        }
+    }
+
+    fn virtual_display() -> DisplayInfo {
+        DisplayInfo {
+            id: 1,
+            name: "\\\\.\\DISPLAY2".to_string(),
+            device_string: "Parsec Virtual Display".to_string(),
+            left: 2560,
+            top: 0,
+            width: 3840,
+            height: 2160,
+            primary: false,
+            virtual_display: true,
+            hmonitor: 1234,
+            dxgi_adapter_idx: Some(2),
+            dxgi_output_idx: Some(0),
+            dxgi_adapter_name: "Parsec Virtual Adapter".to_string(),
+        }
+    }
+
+    #[test]
+    fn ddagrab_command_uses_dxgi_mapping_not_display_id() {
+        let command = build_ffmpeg_command(&test_config(), &virtual_display(), "hevc_nvenc")
+            .expect("command should build");
+
+        assert!(command
+            .windows(2)
+            .any(|window| window[0] == "-init_hw_device" && window[1] == "d3d11va=t2s_dda:2"));
+        assert!(command
+            .windows(2)
+            .any(|window| window[0] == "-i" && window[1].contains("ddagrab=output_idx=0:")));
+        assert!(!command
+            .windows(2)
+            .any(|window| window[0] == "-i" && window[1].contains("ddagrab=output_idx=1:")));
+    }
+
+    #[test]
+    fn output_dimensions_parse_full_ddagrab_video_size() {
+        let mut config = test_config();
+        config.scale.clear();
+        let command = build_ffmpeg_command(&config, &virtual_display(), "hevc_nvenc")
+            .expect("command should build");
+
+        assert_eq!(output_dimensions(&config, &command), (3840, 2160));
+    }
+
+    #[test]
+    fn ffmpeg_command_forces_constant_rate_output() {
+        let config = test_config();
+        let command = build_ffmpeg_command(&config, &virtual_display(), "hevc_nvenc")
+            .expect("command should build");
+
+        assert!(command
+            .windows(2)
+            .any(|window| window[0] == "-fps_mode" && window[1] == "cfr"));
+        assert!(command
+            .windows(2)
+            .any(|window| window[0] == "-r" && window[1] == config.fps.to_string()));
+        assert!(command
+            .windows(2)
+            .any(|window| window[0] == "-strict_gop" && window[1] == "1"));
+    }
+
+    #[test]
+    fn qsv_dxgi_command_keeps_frames_on_gpu() {
+        let config = test_config();
+        let command =
+            build_ffmpeg_command(&config, &virtual_display(), "hevc_qsv").expect("command");
+        let filter = command
+            .windows(2)
+            .find_map(|window| (window[0] == "-vf").then_some(window[1].as_str()))
+            .expect("filter chain should exist");
+
+        assert!(command.windows(2).any(|window| {
+            window[0] == "-init_hw_device" && window[1] == "qsv=t2s_qsv@t2s_dda"
+        }));
+        assert!(filter.contains("hwmap=derive_device=qsv"));
+        assert!(filter.contains("scale_qsv=w=2800:h=1840:format=nv12"));
+    }
+
+    #[test]
+    fn idle_flush_emits_final_complete_access_unit() {
+        let mut parser = HevcAccessUnitParser::default();
+        let idr_nal = [0, 0, 0, 1, 38, 1, 0x80, 0];
+
+        assert!(parser.push(&idr_nal).is_empty());
+
+        let packets = parser.flush_idle();
+        assert_eq!(packets.len(), 1);
+        assert!(packets[0].flags & protocol::FLAG_VCL != 0);
+        assert!(packets[0].flags & protocol::FLAG_KEYFRAME != 0);
+        assert_eq!(packets[0].payload, idr_nal);
+        assert_eq!(parser.buffer_len(), 0);
+    }
+
+    #[test]
+    fn parser_prepends_cached_config_to_headerless_keyframes() {
+        let mut parser = HevcAccessUnitParser::default();
+        let config_nals = [
+            0, 0, 0, 1, 64, 1, 1, 0, 0, 0, 1, 66, 1, 2, 0, 0, 0, 1, 68, 1, 3,
+        ];
+        let idr_nal = [0, 0, 0, 1, 38, 1, 0x80, 4];
+        let next_nal = [0, 0, 0, 1, 2, 1, 0x80, 5];
+        let flush_nal = [0, 0, 0, 1, 2, 1, 0x80, 6];
+
+        assert!(parser.push(&config_nals).is_empty());
+        assert!(parser.push(&idr_nal).is_empty());
+        assert!(parser.push(&next_nal).is_empty());
+        let packets = parser.push(&flush_nal);
+
+        assert_eq!(packets.len(), 1);
+        assert!(packets[0].flags & protocol::FLAG_KEYFRAME != 0);
+        assert!(packets[0].flags & protocol::FLAG_CONFIG_NAL != 0);
+        assert!(packets[0].payload.starts_with(&config_nals));
+        assert!(packets[0].payload.ends_with(&idr_nal));
+    }
+
+    #[test]
+    fn video_timestamps_stay_dense_after_host_idle() {
+        let frame_duration_us = 1_000_000 / 60;
+
+        assert_eq!(video_timestamp_us(0, frame_duration_us), 0);
+        assert_eq!(video_timestamp_us(1, frame_duration_us), 16_666);
+        assert_eq!(video_timestamp_us(2, frame_duration_us), 33_332);
+    }
+
+    #[test]
+    fn effective_config_bounds_1080p_recovery_to_quarter_second() {
+        let mut config = test_config();
+        config.gop = 60;
+        config.scale = "1920:1080".to_string();
+
+        let config = effective_stream_config(config, &virtual_display(), "hevc_qsv");
+
+        assert_eq!(config.gop, 15);
+    }
+
+    #[test]
+    fn effective_config_uses_longer_recovery_for_above_tablet_native_resolution() {
+        let mut config = test_config();
+        config.gop = 60;
+        config.scale.clear();
+
+        let config = effective_stream_config(config, &virtual_display(), "hevc_nvenc");
+
+        assert_eq!(config.gop, 20);
+    }
+
+    #[test]
+    fn native_target_profile_promotes_nvenc_machines_to_native_60() {
+        let mut config = test_config();
+        config.encoder = "auto".to_string();
+
+        let config = effective_stream_config(config, &virtual_display(), "hevc_nvenc");
+
+        assert_eq!(config.scale, NATIVE_TARGET_SCALE);
+        assert_eq!(config.fps, 60);
+        assert_eq!(config.bitrate, NATIVE_TARGET_BITRATE);
+        assert_eq!(config.bufsize, NATIVE_TARGET_BUFSIZE);
+        assert_eq!(config.gop, NATIVE_TARGET_GOP_60);
+    }
+
+    #[test]
+    fn native_target_profile_keeps_qsv_machines_at_universal_target() {
+        let mut config = test_config();
+        config.encoder = "auto".to_string();
+
+        let config = effective_stream_config(config, &virtual_display(), "hevc_qsv");
+
+        assert_eq!(config.scale, NATIVE_TARGET_SCALE);
+        assert_eq!(config.fps, 60);
+        assert_eq!(config.bitrate, NATIVE_TARGET_BITRATE);
+        assert_eq!(config.bufsize, NATIVE_TARGET_BUFSIZE);
+        assert_eq!(config.gop, NATIVE_TARGET_GOP_60);
+    }
+
+    #[test]
+    fn native_target_bitrate_uses_transport_safe_native_profile() {
+        let pixels_1440p = 2560.0 * 1440.0;
+        let pixels_4k = 3840.0 * 2160.0;
+        let pixels_native = 2800.0 * 1840.0;
+        let factor: f64 =
+            ((pixels_native - pixels_1440p) / (pixels_4k - pixels_1440p)) * 20.0 + 20.0;
+        let bitrate_mbps = (factor * 2.0).round() as u32;
+
+        assert_eq!(bitrate_mbps, 53);
+        assert_eq!(NATIVE_TARGET_BITRATE, "35M");
+    }
+
+    #[test]
+    fn bottleneck_classifier_flags_transport_backpressure() {
+        let mut stats = StreamStats {
+            running: true,
+            current_fps: 60.0,
+            current_mbps: 45.0,
+            max_socket_write_ms: 80.0,
+            socket_write_blocked_events: 1,
+            ..StreamStats::default()
+        };
+        let config = test_config();
+
+        let bottleneck = classify_bottleneck(&stats, &config);
+        assert!(bottleneck.contains("transport backpressure"));
+
+        stats.socket_write_blocked_events = 0;
+        stats.max_socket_write_ms = 0.0;
+        stats.resync_events = 1;
+        let bottleneck = classify_bottleneck(&stats, &config);
+        assert!(bottleneck.contains("host queue overflow"));
+    }
+
+    #[test]
+    fn receiver_stats_timeout_detection_handles_windows_localized_errors() {
+        assert!(is_receiver_stats_timeout(
+            "socket header read failed: connection attempt failed (os error 10060)"
+        ));
+        assert!(is_receiver_stats_timeout(
+            "socket header read failed: 由于连接方在一段时间后没有正确答复 (os error 10060)"
+        ));
+        assert!(!is_receiver_stats_timeout("bad protocol magic"));
+    }
+
+    #[test]
+    fn send_pacer_caps_added_latency_per_packet() {
+        let pacer = SendPacer::new(true, 35_000, 60);
+
+        assert_eq!(pacer.target_delay_for_sent(pacer.burst_bytes), Duration::ZERO);
+        assert!(pacer.target_delay_for_sent(pacer.burst_bytes + 16 * 1024) > Duration::ZERO);
+        assert_eq!(
+            pacer.target_delay_for_sent(pacer.burst_bytes + 512 * 1024),
+            Duration::from_millis(6)
+        );
+    }
+
+    fn test_packet(sequence: u32, flags: u16) -> EncodedPacket {
+        EncodedPacket {
+            sequence,
+            timestamp_us: 0,
+            flags,
+            payload: vec![sequence as u8],
+        }
+    }
+
+    #[test]
+    fn realtime_queue_drops_oldest_stale_delta_first() {
+        let queue = SenderQueue::new(2);
+        assert!(matches!(
+            queue.push(test_packet(1, protocol::FLAG_VCL | protocol::FLAG_DROPPABLE)),
+            QueuePushResult::Queued
+        ));
+        assert!(matches!(
+            queue.push(test_packet(2, protocol::FLAG_VCL | protocol::FLAG_DROPPABLE)),
+            QueuePushResult::Queued
+        ));
+
+        let result = queue.push_realtime(test_packet(
+            3,
+            protocol::FLAG_VCL | protocol::FLAG_DROPPABLE,
+        ));
+
+        assert!(matches!(result, QueueRealtimePushResult::Queued { dropped: 1 }));
+        let guard = queue.inner.lock().expect("queue lock");
+        let sequences = guard
+            .packets
+            .iter()
+            .map(|packet| packet.sequence)
+            .collect::<Vec<_>>();
+        assert_eq!(sequences, vec![2, 3]);
+        assert_eq!(guard.dropped_packets, 1);
+    }
+
+    #[test]
+    fn realtime_queue_drops_incoming_delta_before_displacing_essential_packets() {
+        let queue = SenderQueue::new(2);
+        assert!(matches!(
+            queue.push(test_packet(1, protocol::FLAG_CONFIG_NAL)),
+            QueuePushResult::Queued
+        ));
+        assert!(matches!(
+            queue.push(test_packet(2, protocol::FLAG_KEYFRAME | protocol::FLAG_VCL)),
+            QueuePushResult::Queued
+        ));
+
+        let result = queue.push_realtime(test_packet(
+            3,
+            protocol::FLAG_VCL | protocol::FLAG_DROPPABLE,
+        ));
+
+        assert!(matches!(result, QueueRealtimePushResult::DroppedIncoming));
+        let guard = queue.inner.lock().expect("queue lock");
+        let sequences = guard
+            .packets
+            .iter()
+            .map(|packet| packet.sequence)
+            .collect::<Vec<_>>();
+        assert_eq!(sequences, vec![1, 2]);
+        assert_eq!(guard.dropped_packets, 1);
+    }
+
+    #[test]
+    fn realtime_queue_lets_keyframe_replace_queued_essential_packets() {
+        let queue = SenderQueue::new(2);
+        assert!(matches!(
+            queue.push(test_packet(1, protocol::FLAG_CONFIG_NAL)),
+            QueuePushResult::Queued
+        ));
+        assert!(matches!(
+            queue.push(test_packet(2, protocol::FLAG_KEYFRAME | protocol::FLAG_VCL)),
+            QueuePushResult::Queued
+        ));
+
+        let result = queue.push_realtime(test_packet(
+            3,
+            protocol::FLAG_KEYFRAME | protocol::FLAG_VCL,
+        ));
+
+        assert!(matches!(result, QueueRealtimePushResult::Queued { dropped: 2 }));
+        let guard = queue.inner.lock().expect("queue lock");
+        let sequences = guard
+            .packets
+            .iter()
+            .map(|packet| packet.sequence)
+            .collect::<Vec<_>>();
+        assert_eq!(sequences, vec![3]);
+        assert_eq!(guard.dropped_packets, 2);
+    }
+}
+
 struct SendPacer {
     enabled: bool,
     bytes_per_second: f64,
     burst_bytes: usize,
     chunk_bytes: usize,
+    max_sleep_per_packet: Duration,
 }
 
 impl SendPacer {
@@ -1181,10 +2098,25 @@ impl SendPacer {
         Self {
             enabled,
             bytes_per_second,
-            // Allow about one frame budget immediately, then pace oversized frames.
-            burst_bytes: frame_budget.max(32_768.0) as usize,
-            chunk_bytes: 32 * 1024,
+            // Allow about one frame budget immediately. Extra bytes get a small smoothing delay,
+            // but never enough to become visible end-to-end latency.
+            burst_bytes: frame_budget.clamp(32_768.0, 128_000.0) as usize,
+            chunk_bytes: 16 * 1024,
+            max_sleep_per_packet: Duration::from_millis(6),
         }
+    }
+
+    fn target_delay_for_sent(&self, sent: usize) -> Duration {
+        if !self.enabled {
+            return Duration::ZERO;
+        }
+        if sent <= self.burst_bytes {
+            return Duration::ZERO;
+        }
+
+        let paced_bytes = sent - self.burst_bytes;
+        Duration::from_secs_f64(paced_bytes as f64 / self.bytes_per_second)
+            .min(self.max_sleep_per_packet)
     }
 }
 
@@ -1209,12 +2141,97 @@ struct SenderMetrics {
     last_error: String,
 }
 
+#[derive(Default, Clone)]
+struct ReceiverMetrics {
+    stats: protocol::ReceiverStats,
+    stats_messages: u64,
+    last_error: String,
+}
+
+fn receiver_stats_loop(
+    stream: &mut TcpStream,
+    metrics: Arc<Mutex<ReceiverMetrics>>,
+    stop: Arc<AtomicBool>,
+) {
+    while !stop.load(Ordering::SeqCst) {
+        match protocol::read_message(stream) {
+            Ok(message) if message.message_type == protocol::TYPE_STATS => {
+                if let Some(stats) = protocol::parse_receiver_stats_payload(&message.payload) {
+                    if let Ok(mut guard) = metrics.lock() {
+                        guard.stats = stats;
+                        guard.stats_messages += 1;
+                        guard.last_error.clear();
+                    }
+                } else if let Ok(mut guard) = metrics.lock() {
+                    guard.last_error = "receiver stats payload too short".to_string();
+                }
+            }
+            Ok(message) if message.message_type == protocol::TYPE_KEYFRAME_REQUEST => {
+                if let Ok(mut guard) = metrics.lock() {
+                    guard.last_error = "receiver requested keyframe; host-side request handling is not implemented yet".to_string();
+                }
+            }
+            Ok(message) => {
+                if let Ok(mut guard) = metrics.lock() {
+                    guard.last_error =
+                        format!("unexpected receiver message type {}", message.message_type);
+                }
+            }
+            Err(error) => {
+                if stop.load(Ordering::SeqCst) || is_receiver_stats_timeout(&error) {
+                    continue;
+                }
+                if let Ok(mut guard) = metrics.lock() {
+                    guard.last_error = error;
+                }
+                break;
+            }
+        }
+    }
+}
+
+fn is_receiver_stats_timeout(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("timed out")
+        || lower.contains("would block")
+        || lower.contains("temporarily unavailable")
+        || lower.contains("10060")
+        || error.contains("超时")
+}
+
+fn apply_receiver_metrics(stats: &mut StreamStats, receiver: &ReceiverMetrics) {
+    stats.receiver_running = receiver.stats.running;
+    stats.receiver_decoder_started = receiver.stats.decoder_started;
+    stats.receiver_surface_ready = receiver.stats.surface_ready;
+    stats.receiver_packets = receiver.stats.packets;
+    stats.receiver_bytes = receiver.stats.bytes;
+    stats.receiver_queued_inputs = receiver.stats.queued_inputs;
+    stats.receiver_rendered_outputs = receiver.stats.rendered_outputs;
+    stats.receiver_dropped_packets = receiver.stats.dropped_packets;
+    stats.receiver_sequence_gaps = receiver.stats.sequence_gaps;
+    stats.receiver_config_packets = receiver.stats.config_packets;
+    stats.receiver_keyframes = receiver.stats.keyframes;
+    stats.receiver_last_sequence = receiver.stats.last_sequence;
+    stats.receiver_queue_depth = receiver.stats.queue_depth;
+    stats.receiver_stream_width = receiver.stats.stream_width;
+    stats.receiver_stream_height = receiver.stats.stream_height;
+    stats.receiver_stream_fps = receiver.stats.stream_fps;
+    stats.receiver_last_error = receiver.stats.last_error;
+    stats.receiver_receive_mbps = receiver.stats.receive_mbps;
+    stats.receiver_input_fps = receiver.stats.input_fps;
+    stats.receiver_render_fps = receiver.stats.render_fps;
+    stats.receiver_drop_fps = receiver.stats.drop_fps;
+    stats.receiver_max_receive_gap_ms = receiver.stats.max_receive_gap_ms;
+    stats.receiver_max_input_gap_ms = receiver.stats.max_input_gap_ms;
+    stats.receiver_max_render_gap_ms = receiver.stats.max_render_gap_ms;
+}
+
 fn sender_loop(
     mut stream: TcpStream,
     queue: Arc<SenderQueue>,
     metrics: Arc<Mutex<SenderMetrics>>,
     stop: Arc<AtomicBool>,
-    pacer: SendPacer,
+    mut pacer: SendPacer,
 ) {
     while let Some(packet) = queue.pop(&stop) {
         let write_start = Instant::now();
@@ -1224,12 +2241,13 @@ fn sender_loop(
             packet.timestamp_us,
             packet.flags,
             &packet.payload,
-            &pacer,
+            &mut pacer,
         );
         let write_ms = write_start.elapsed().as_secs_f64() * 1000.0;
 
         match result {
             Ok(send_report) => {
+                let socket_write_ms = (write_ms - send_report.sleep_ms).max(0.0);
                 if let Ok(mut guard) = metrics.lock() {
                     guard.sent_packets += 1;
                     guard.sent_bytes += packet.payload.len() as u64;
@@ -1239,11 +2257,11 @@ fn sender_loop(
                     if packet.flags & protocol::FLAG_KEYFRAME != 0 {
                         guard.sent_keyframe_packets += 1;
                     }
-                    if write_ms >= 10.0 {
+                    if socket_write_ms >= 10.0 {
                         guard.socket_write_blocked_events += 1;
-                        guard.socket_write_blocked_ms += write_ms;
+                        guard.socket_write_blocked_ms += socket_write_ms;
                     }
-                    guard.max_socket_write_ms = guard.max_socket_write_ms.max(write_ms);
+                    guard.max_socket_write_ms = guard.max_socket_write_ms.max(socket_write_ms);
                     guard.max_packet_send_ms = guard.max_packet_send_ms.max(write_ms);
                     if send_report.paced {
                         guard.paced_packets += 1;
@@ -1337,6 +2355,21 @@ impl AnnexBParser {
     fn buffer_len(&self) -> usize {
         self.buffer.len()
     }
+
+    fn flush_tail(&mut self) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        let Some((first, first_len)) = find_start_code(&self.buffer, 0) else {
+            self.buffer.clear();
+            return out;
+        };
+        if first > 0 {
+            self.buffer.drain(..first);
+        }
+        if self.buffer.len() > first_len {
+            out.push(std::mem::take(&mut self.buffer));
+        }
+        out
+    }
 }
 
 struct EncodedPacket {
@@ -1359,6 +2392,18 @@ struct SenderQueue {
     capacity: usize,
 }
 
+enum QueuePushResult {
+    Queued,
+    Full(EncodedPacket),
+    Closed,
+}
+
+enum QueueRealtimePushResult {
+    Queued { dropped: u64 },
+    DroppedIncoming,
+    Closed,
+}
+
 impl SenderQueue {
     fn new(capacity: usize) -> Self {
         Self {
@@ -1368,28 +2413,67 @@ impl SenderQueue {
         }
     }
 
-    fn push(&self, packet: EncodedPacket) {
+    fn push(&self, packet: EncodedPacket) -> QueuePushResult {
         let mut guard = match self.inner.lock() {
             Ok(guard) => guard,
-            Err(_) => return,
+            Err(_) => return QueuePushResult::Closed,
         };
 
-        while guard.packets.len() >= self.capacity {
-            if drop_stale_sender_packet(&mut guard.packets) {
-                guard.dropped_packets += 1;
-            } else {
-                break;
-            }
+        if guard.closed {
+            return QueuePushResult::Closed;
+        }
+        if guard.packets.len() >= self.capacity {
+            return QueuePushResult::Full(packet);
         }
 
         guard.packets.push_back(packet);
         self.cv.notify_one();
+        QueuePushResult::Queued
+    }
+
+    fn push_realtime(&self, packet: EncodedPacket) -> QueueRealtimePushResult {
+        let mut guard = match self.inner.lock() {
+            Ok(guard) => guard,
+            Err(_) => return QueueRealtimePushResult::Closed,
+        };
+
+        if guard.closed {
+            return QueueRealtimePushResult::Closed;
+        }
+
+        let mut dropped = 0u64;
+        while guard.packets.len() >= self.capacity {
+            if drop_stale_sender_packet(&mut guard.packets) {
+                guard.dropped_packets += 1;
+                dropped += 1;
+                continue;
+            }
+
+            if packet.flags & protocol::FLAG_KEYFRAME != 0 {
+                dropped += guard.packets.len() as u64;
+                guard.dropped_packets += guard.packets.len() as u64;
+                guard.packets.clear();
+                break;
+            }
+
+            if packet.flags & protocol::FLAG_DROPPABLE != 0 {
+                guard.dropped_packets += 1;
+                return QueueRealtimePushResult::DroppedIncoming;
+            }
+
+            return QueueRealtimePushResult::DroppedIncoming;
+        }
+
+        guard.packets.push_back(packet);
+        self.cv.notify_one();
+        QueueRealtimePushResult::Queued { dropped }
     }
 
     fn pop(&self, stop: &AtomicBool) -> Option<EncodedPacket> {
         let mut guard = self.inner.lock().ok()?;
         loop {
             if let Some(packet) = guard.packets.pop_front() {
+                self.cv.notify_one();
                 return Some(packet);
             }
             if guard.closed || stop.load(Ordering::SeqCst) {
@@ -1423,20 +2507,13 @@ fn drop_stale_sender_packet(packets: &mut VecDeque<EncodedPacket>) -> bool {
         return true;
     }
 
-    if let Some(index) = packets
-        .iter()
-        .position(|packet| packet.flags & protocol::FLAG_CONFIG_NAL == 0)
-    {
-        packets.remove(index);
-        return true;
-    }
-
     false
 }
 
 #[derive(Default)]
 struct HevcAccessUnitParser {
     annex_b: AnnexBParser,
+    config_nals: Vec<u8>,
     pending: Vec<u8>,
     pending_flags: u16,
     pending_has_vcl: bool,
@@ -1455,6 +2532,12 @@ impl HevcAccessUnitParser {
                 self.flush_pending(&mut out);
             }
 
+            if flags & protocol::FLAG_CONFIG_NAL != 0 {
+                if nal_type == 32 {
+                    self.config_nals.clear();
+                }
+                self.config_nals.extend_from_slice(&nal);
+            }
             self.pending_flags |= flags;
             if nal_type <= 31 {
                 self.pending_has_vcl = true;
@@ -1468,15 +2551,48 @@ impl HevcAccessUnitParser {
         self.annex_b.buffer_len() + self.pending.len()
     }
 
+    fn flush_idle(&mut self) -> Vec<EncodedPacket> {
+        let mut out = Vec::new();
+        for nal in self.annex_b.flush_tail() {
+            let flags = flags_for_nal(&nal);
+            let nal_type = nal_type(&nal);
+            if flags & protocol::FLAG_CONFIG_NAL != 0 {
+                if nal_type == 32 {
+                    self.config_nals.clear();
+                }
+                self.config_nals.extend_from_slice(&nal);
+            }
+            self.pending_flags |= flags;
+            if nal_type <= 31 {
+                self.pending_has_vcl = true;
+            }
+            self.pending.extend_from_slice(&nal);
+        }
+        self.flush_pending(&mut out);
+        out
+    }
+
     fn flush_pending(&mut self, out: &mut Vec<EncodedPacket>) {
         if self.pending.is_empty() || !self.pending_has_vcl {
             return;
         }
+        let mut flags = self.pending_flags;
+        let mut payload = std::mem::take(&mut self.pending);
+        if flags & protocol::FLAG_KEYFRAME != 0
+            && flags & protocol::FLAG_CONFIG_NAL == 0
+            && !self.config_nals.is_empty()
+        {
+            let mut keyframe = Vec::with_capacity(self.config_nals.len() + payload.len());
+            keyframe.extend_from_slice(&self.config_nals);
+            keyframe.extend_from_slice(&payload);
+            payload = keyframe;
+            flags |= protocol::FLAG_CONFIG_NAL;
+        }
         out.push(EncodedPacket {
             sequence: 0,
             timestamp_us: 0,
-            flags: self.pending_flags,
-            payload: std::mem::take(&mut self.pending),
+            flags,
+            payload,
         });
         self.pending_flags = 0;
         self.pending_has_vcl = false;
