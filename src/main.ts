@@ -149,9 +149,9 @@ app.innerHTML = `
             </select>
           </label>
           <label>FPS<input id="fpsInput" type="number" min="1" max="120" value="60" /></label>
-          <label>Bitrate<input id="bitrateInput" value="35M" /></label>
-          <label>VBV buffer<input id="bufsizeInput" value="1M" /></label>
-          <label>GOP<input id="gopInput" type="number" min="1" value="6" /></label>
+          <label>Bitrate<input id="bitrateInput" value="20M" /></label>
+          <label>VBV buffer<input id="bufsizeInput" value="256K" /></label>
+          <label>GOP<input id="gopInput" type="number" min="1" value="4" /></label>
           <label class="checkboxLabel"><input id="sendPacingInput" type="checkbox" /> Pace oversized frame sends</label>
           <label>Forwarded host:port<input id="targetInput" value="127.0.0.1:17005" /></label>
         </div>
@@ -208,6 +208,15 @@ void listen<StreamStats>('stream-stats', (event) => {
   renderStats(event.payload);
 });
 
+void listen<number>('display-selected', (event) => {
+  displaySelect.value = String(event.payload);
+  renderSelectedDisplay();
+});
+
+void listen<string>('tray-error', (event) => {
+  appendLog(`Tray action failed: ${event.payload}`);
+});
+
 getButton('listTargetsButton').addEventListener('click', async () => {
   await runAction('List HDC targets', async () => {
     const output = await invoke<string>('list_hdc_targets', { hdcPath: hdcPath.value });
@@ -226,7 +235,10 @@ getButton('refreshDisplaysButton').addEventListener('click', async () => {
   await loadDisplays();
 });
 
-displaySelect.addEventListener('change', renderSelectedDisplay);
+displaySelect.addEventListener('change', () => {
+  renderSelectedDisplay();
+  void invoke('select_display', { displayId: Number(displaySelect.value) });
+});
 
 getButton('startButton').addEventListener('click', async () => {
   await runAction('Start stream', async () => {

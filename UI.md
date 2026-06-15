@@ -1,664 +1,355 @@
-# Tablet2Screen UI Design
+# Tablet2Screen UI Design Philosophy (Codex Implementation Spec)
 
-## 1. Design Principle
+## 1. Core Design Philosophy
 
-Tablet2Screen has two clients:
+Tablet2Screen is not a traditional multi-page application.
 
-- **Desktop App**: control center.
-- **Tablet App**: display receiver.
+It is a **state-driven visual system** whose purpose is to:
 
-The UI should feel:
+- Make connection state immediately observable
+- Make streaming state visually continuous
+- Make failure diagnosable without reading logs
+- Minimize cognitive load during operation
 
-- Simple
-- Modern
-- Calm
-- Technical but not intimidating
-- Focused on connection status and display quality
+### Fundamental Principle
 
-Core product experience:
+> UI is a reflection of system state, not a navigation structure.
 
-    Open tablet app.
-    Open desktop app.
-    Connect.
-    Tablet becomes a second screen.
+There is no “feature browsing”.
+There is only:
+- connection
+- streaming
+- health
+- recovery
 
----
-
-## 2. Visual Style
-
-### 2.1 Overall Style
-
-Use a clean modern utility style:
-
-- Rounded cards
-- Soft shadows
-- Large status indicators
-- Clear primary actions
-- Minimal decorative elements
-- Dense but readable layout on desktop
-- Almost invisible UI during tablet display mode
-
-The UI should feel closer to:
-
-- Moonlight / Sunshine simplicity
-- Windows 11 settings clarity
-- Developer-tool level diagnostics when needed
-
-Avoid:
-
-- Gamer-style neon UI
-- Overly colorful dashboards
-- Too many icons
-- Heavy gradients
-- Complex animation
+Everything else is secondary.
 
 ---
 
-## 3. Color System
+## 2. Interaction Model
 
-Use a restrained modern palette.
+The entire system follows a strict state machine:
 
-### 3.1 Light Theme
+```
+Idle → Searching → Pairing → Connecting → Connected → Streaming
+                         ↘ Error → Recovery → (previous state)
+```
 
-    Background:      #F7F8FA
-    Card:            #FFFFFF
-    Primary Text:    #111827
-    Secondary Text:  #6B7280
-    Border:          #E5E7EB
-    Primary Blue:    #2563EB
-    Success Green:   #16A34A
-    Warning Amber:   #F59E0B
-    Error Red:       #DC2626
+### UI Rule
 
-### 3.2 Dark Theme
-
-    Background:      #0F172A
-    Card:            #111827
-    Elevated Card:   #1F2937
-    Primary Text:    #F9FAFB
-    Secondary Text:  #9CA3AF
-    Border:          #374151
-    Primary Blue:    #3B82F6
-    Success Green:   #22C55E
-    Warning Amber:   #FBBF24
-    Error Red:       #EF4444
-
-### 3.3 Status Colors
-
-    Connected:       Green
-    Connecting:      Blue
-    Degraded:        Amber
-    Error:           Red
-    Idle:            Gray
-
-Keep color usage functional.
-Do not color everything.
+- UI must NEVER require manual page switching to reflect state changes
+- UI must ALWAYS auto-transition when state changes
+- UI must NEVER expose internal architecture (no “modules”, “panels”, “tabs” as primary navigation)
 
 ---
 
-## 4. Typography
+## 3. Visual Language
 
-Use a modern sans-serif font.
+### 3.1 Background System
 
-Recommended desktop typography:
+The background is not a solid color.
 
-    Page title:       22-26px, semibold
-    Section title:    16-18px, semibold
-    Body text:        14px
-    Secondary text:   13px
-    Status text:      13-14px, medium
-    Logs:             12-13px, monospace
+It is a **soft atmospheric field** composed of:
 
-Recommended tablet typography:
+- multiple overlapping pastel gradients
+- radial blur layers
+- low-frequency noise texture (optional)
 
-    Pairing code:     36-48px, semibold
-    Status title:     22-28px
-    Body text:        15-16px
-    Overlay text:     13-14px
+Allowed palette family:
+- soft blue
+- soft purple
+- soft orange
+- soft green
+- soft pink
 
----
+### Constraints
 
-# 5. Desktop App UI
-
-## 5.1 Desktop Layout
-
-Use a left sidebar + card dashboard layout.
-
-    ┌───────────────┬──────────────────────────────────────┐
-    │ Tablet2Screen │ Dashboard                            │
-    │               │                                      │
-    │ ● Dashboard   │ ┌──────────────┐ ┌──────────────┐    │
-    │   Devices     │ │ Connection   │ │ Display      │    │
-    │   Display     │ └──────────────┘ └──────────────┘    │
-    │   Stream      │ ┌──────────────┐ ┌──────────────┐    │
-    │   Diagnostics │ │ Stream       │ │ Health       │    │
-    │   Settings    │ └──────────────┘ └──────────────┘    │
-    └───────────────┴──────────────────────────────────────┘
-
-Style:
-
-- Sidebar width: about 200px
-- Content max width: 900-1100px
-- Cards use 12-16px radius
-- Use generous spacing
-- Important buttons should be visually obvious
+- no harsh contrast regions
+- no sharp gradient transitions
+- no dominant single color
+- background must feel “ambient”, not “designed”
 
 ---
 
-## 5.2 Desktop Dashboard
+### 3.2 Card System
 
-The dashboard should answer immediately:
+UI content is organized into layered glass-like cards.
 
-- Is the tablet connected?
-- Which transport is active?
-- Is the virtual display active?
-- Is the stream running?
-- Is performance healthy?
+#### Layer hierarchy:
 
-Main cards:
+1. Base Cards (primary information containers)
+   - semi-transparent white
+   - blurred background (glass effect)
+   - rounded corners
+   - slight shadow
 
-    Connection
-    - Device name
-    - Connection state
-    - Transport mode
-    - Connect / Disconnect
+2. Secondary Cards (nested information)
+   - no fill
+   - only border + subtle hover highlight
+   - visually lighter than base cards
 
-    Display
-    - Virtual display state
-    - Resolution
-    - Refresh rate
-    - Open Windows display settings
-
-    Stream
-    - Quality preset
-    - Codec
-    - Bitrate
-    - FPS
-    - Start / Stop streaming
-
-    Health
-    - Current FPS
-    - Latency
-    - Dropped frames
-    - Connection quality
-
-Recommended dashboard copy:
-
-    Connected to MatePad BKY-W20
-    USB Direct
-    Virtual display active
-    Streaming 1920x1200 @ 60 FPS
+3. Interaction Elements (buttons / toggles)
+   - higher opacity than cards
+   - clearly clickable
+   - strong state feedback (hover / active)
 
 ---
 
-## 5.3 Devices Page
+### 3.3 Visual Priority Rule
+
+- State > Content > Decoration
+
+Meaning:
+- connection status must be most visible
+- data is secondary
+- decoration must never compete with state visibility
+
+---
+
+## 4. Desktop UI Philosophy
+
+### 4.1 Structural Constraint
+
+Desktop UI must NOT use sidebar navigation.
+
+Instead:
+
+- single dashboard surface
+- grid-based card layout
+- floating status emphasis
+
+### Layout Model
+
+```
+[ Custom Title Bar ]
+[ Global Status Strip ]
+[ Card Grid Dashboard ]
+```
+
+---
+
+### 4.2 Dashboard Composition
+
+Dashboard consists of four conceptual blocks:
+
+- Connection state
+- Display state
+- Streaming state
+- System health
+
+Each block:
+- self-contained
+- independently updated
+- visually consistent
+
+---
+
+### 4.3 Title Bar Requirements
+
+Desktop app must implement a fully custom title bar:
+
+Required capabilities:
+- window drag
+- minimize
+- maximize / restore toggle
+- close
+- double-click maximize/restore
+
+Interaction rules:
+- hover reveals controls
+- active click provides tactile feedback animation
+- disabled state must be visually distinct
+
+---
+
+### 4.4 Desktop Interaction Style
+
+All interactions follow:
+
+- smooth transitions (200–300ms)
+- no instant state switching
+- visual confirmation for every action
+- subtle motion for feedback (scale / opacity / blur changes)
+
+---
+
+## 5. Tablet UI Philosophy
+
+### 5.1 Dual-Mode Structure
+
+Tablet app has exactly two modes:
+
+#### Mode A: Connection Mode
+- pairing screen
+- device availability
+- transport selection
+- settings entry
+
+#### Mode B: Display Mode
+- fullscreen rendering surface
+- no persistent UI
+
+---
+
+### 5.2 Mode Transition Rule
+
+```
+Connected → immediately enter Display Mode
+Disconnected → immediately return to Connection Mode
+```
+
+No manual navigation is allowed between modes.
+
+---
+
+### 5.3 Display Mode Philosophy
+
+Display mode is intentionally minimal:
+
+- fullscreen video surface
+- no permanent UI
+- no navigation
+- no system chrome
+
+Only one persistent element exists:
+- floating control button
+
+---
+
+### 5.4 Floating Control Button
 
 Purpose:
+- temporary access to system controls
 
-- Show detected tablets.
-- Let the user choose Wi-Fi or USB.
-- Handle pairing.
+Behavior:
+- low opacity by default
+- becomes prominent on hover/tap
+- opens transient overlay panel
 
-Device card:
-
-    MatePad BKY-W20
-    Status: Available
-    Wi-Fi: Available
-    USB: Detected
-
-    [Connect via USB] [Connect via Wi-Fi]
-
-Transport selector:
-
-    Auto
-    USB Direct
-    Wi-Fi LAN
-
-Important wording:
-
-    USB Direct uses the USB cable as a private data channel.
-    It does not require USB tethering.
+Must NOT interfere with content visibility.
 
 ---
 
-## 5.4 Display Page
+### 5.5 Overlay Panel
 
-Purpose:
+Overlay is:
+- temporary
+- auto-dismiss (timeout-based)
+- glass-style translucent surface
 
-- Manage the virtual display.
-- Select display mode and resolution.
-
-Options:
-
-    Virtual Display
-    - Active / Missing / Error
-
-    Display Mode
-    - Extend desktop
-    - Mirror primary display
-
-    Resolution
-    - 1280x800
-    - 1600x1000
-    - 1920x1200
-    - Native
-
-    Refresh Rate
-    - 30 Hz
-    - 60 Hz
-
-    Orientation
-    - Landscape
-    - Portrait
-
-Primary action:
-
-    [Create Virtual Display]
-
-Secondary action:
-
-    [Open Windows Display Settings]
-
-For MVP, prioritize:
-
-    Extend desktop
-    1920x1200
-    60 Hz
-    Landscape
+Contains:
+- connection status
+- stream stats
+- reconnect / disconnect actions
+- diagnostics entry
 
 ---
 
-## 5.5 Stream Page
+## 6. State Visualization Philosophy
 
-Purpose:
+Every meaningful system state must be visible in UI:
 
-- Let users choose between clarity, smoothness, and power usage.
+### Required observable states:
 
-Quality presets:
+- connection status
+- transport mode
+- streaming status
+- latency / FPS / bitrate (when relevant)
+- error conditions (if any)
 
-    Smooth
-    - Lower resolution
-    - 60 FPS
-    - Lower bitrate
-    - More stable
+### Rule:
 
-    Balanced
-    - 1920x1200
-    - 60 FPS
-    - Medium bitrate
-    - Default choice
+> If a state affects behavior, it must be visible.
 
-    Sharp
-    - Higher resolution
-    - Higher bitrate
-    - Better text clarity
-
-    Battery Saver
-    - 30 FPS
-    - Lower bitrate
-    - Lower tablet heat
-
-Advanced settings should be collapsed by default.
-
-Advanced options:
-
-    Encoder: Auto / Hardware H.264 / Software
-    Bitrate: Auto / Manual
-    Latency Mode: Low Latency / Balanced / Quality
+But:
+- do not overload UI with raw logs
+- only surface aggregated meaningful metrics
 
 ---
 
-## 5.6 Diagnostics Page
+## 7. Error Representation Philosophy
 
-Diagnostics should be clear and layered.
+Errors are structured in three layers:
 
-Show checks like:
+1. Human-readable summary
+2. Suggested recovery actions
+3. Technical diagnostic details (optional expansion)
 
-    ✓ Tablet detected
-    ✓ Pairing accepted
-    ✓ Virtual display active
-    ✓ Encoder available
-    ✓ Stream started
-    ✕ USB data channel unavailable
+### Rule:
 
-Show session stats:
-
-    Transport: USB Direct
-    Resolution: 1920x1200
-    FPS: 60
-    Bitrate: 18 Mbps
-    Latency: 23 ms
-    Dropped frames: 0.3%
-
-Log viewer:
-
-    [12:01:23] Tablet detected: MatePad BKY-W20
-    [12:01:24] USB transport opened
-    [12:01:25] Virtual display active
-    [12:01:26] Stream started
-
-Actions:
-
-    [Restart Transport]
-    [Restart Stream]
-    [Copy Logs]
-    [Export Debug Report]
+- Never show “generic failure”
+- Every error must explain:
+  - what is broken
+  - why it is broken (high level)
+  - how to recover
 
 ---
 
-# 6. Tablet App UI
+## 8. Animation Philosophy
 
-## 6.1 Tablet Design Principle
+Animations are functional, not decorative.
 
-The tablet app should be almost invisible after connection.
+Allowed usage:
+- state transitions
+- button feedback
+- modal appearance/disappearance
+- connection status changes
 
-Before connection:
-
-- Show pairing and waiting state clearly.
-
-After connection:
-
-- Enter fullscreen display mode.
-- Hide all controls.
-- Show only a small floating control button.
-
----
-
-## 6.2 Tablet Waiting Screen
-
-Layout:
-
-    ┌────────────────────────────────┐
-    │                                │
-    │        Tablet2Screen           │
-    │  Use this tablet as a display  │
-    │                                │
-    │        Pairing Code            │
-    │          482 913               │
-    │                                │
-    │  Wi-Fi LAN: Available          │
-    │  USB Direct: Cable connected   │
-    │                                │
-    │  Waiting for desktop...        │
-    │                                │
-    │  [Settings] [Diagnostics]      │
-    │                                │
-    └────────────────────────────────┘
-
-Style:
-
-- Centered layout
-- Large pairing code
-- Minimal text
-- Clear transport availability
-- Calm dark background preferred
+Forbidden:
+- idle animations
+- decorative motion loops
+- distracting effects
 
 ---
 
-## 6.3 Tablet Fullscreen Display
+## 9. Responsiveness Rules
 
-Once connected:
+UI must adapt to:
 
-    ┌────────────────────────────────┐
-    │                                │
-    │                                │
-    │      Fullscreen Video Surface  │
-    │                                │
-    │                         ●      │
-    │                   Floating Btn │
-    │                                │
-    └────────────────────────────────┘
+- different tablet aspect ratios
+- desktop window resizing
 
-Style:
-
-- Fullscreen video
-- No title bar
-- No bottom navigation
-- No permanent toolbar
-- Floating button opacity around 40-60%
-- Auto-hide overlay
+Constraints:
+- layout must degrade gracefully
+- no layout breakage under resizing
+- core state elements must remain visible
 
 ---
 
-## 6.4 Tablet Control Overlay
+## 10. Implementation Guidance for Codex
 
-Triggered by tapping the floating button.
+Codex should treat this as a **design constraint system**, not a layout spec.
 
-    ┌────────────────────────────┐
-    │ Tablet2Screen              │
-    │                            │
-    │ Status: Connected          │
-    │ Transport: USB Direct      │
-    │ Resolution: 1920x1200      │
-    │ FPS: 60                    │
-    │ Latency: 23 ms             │
-    │                            │
-    │ Display Mode               │
-    │ [Fit Screen] [Original]    │
-    │                            │
-    │ [Reconnect] [Disconnect]   │
-    │ [Diagnostics] [Settings]   │
-    └────────────────────────────┘
+### It is free to decide:
 
-Overlay style:
+- exact layout arrangement
+- component structure
+- visual hierarchy details
+- animation curves
+- spacing system
 
-- Frosted glass / translucent dark card
-- Rounded corners
-- Compact layout
-- Auto-hide after 5 seconds
-- Tap outside to close
+### It must strictly follow:
+
+- state-driven UI architecture
+- dual-mode tablet model
+- no sidebar desktop constraint
+- ambient gradient background system
+- glass-card hierarchy system
+- custom title bar requirement
+- minimal tablet display mode
 
 ---
 
-## 6.5 Tablet Debug Overlay
+## 11. Final Principle
 
-Developer mode only.
+> The system should feel like a living connection channel, not a software dashboard.
 
-    FPS 59.8 | 18 Mbps | 23 ms | USB
+Users should perceive:
 
-Display position:
+- “it is connected”
+- “it is streaming”
+- “it is stable / unstable”
 
-    Top-left corner
-
-Fields:
-
-    FPS
-    Bitrate
-    Latency
-    Dropped frames
-    Transport
-    Decoder type
-
-Default:
-
-    Hidden
+without needing to interpret UI structure.
 
 ---
-
-# 7. Connection States
-
-Use consistent states on both desktop and tablet.
-
-    Idle
-    Searching
-    Device Found
-    Pairing
-    Connecting
-    Connected
-    Streaming
-    Reconnecting
-    Disconnected
-    Error
-
-Example desktop messages:
-
-    Searching
-    Looking for tablets over Wi-Fi and USB.
-
-    Connected
-    MatePad BKY-W20 is ready.
-
-    Streaming
-    Sending virtual display to tablet.
-
-    Error
-    Tablet detected, but USB data channel could not be opened.
-
-Example tablet messages:
-
-    Waiting
-    Open the desktop app to connect.
-
-    Connected
-    Waiting for stream.
-
-    Streaming
-    Displaying secondary screen.
-
-    Reconnecting
-    Connection interrupted. Trying to reconnect.
-
----
-
-# 8. Error UI
-
-Use layered error messages.
-
-Format:
-
-    Title
-    Human explanation
-    Suggested actions
-    Technical details
-
-Example:
-
-    USB Direct unavailable
-
-    The tablet was detected, but the desktop app could not open the USB data channel.
-
-    Try:
-    - Reconnect the USB cable.
-    - Restart the tablet app.
-    - Switch to Wi-Fi LAN mode.
-
-    Technical details:
-    ACCESS_DENIED while opening USB interface.
-
-Avoid vague errors like:
-
-    Connection failed.
-
-Prefer:
-
-    Tablet detected, but transport failed.
-    Virtual display active, but no frames are captured.
-    Stream connected, but tablet decoder is not receiving frames.
-
----
-
-# 9. MVP Screen Scope
-
-## 9.1 Desktop MVP
-
-Required screens:
-
-    Dashboard
-    Devices
-    Display
-    Stream
-    Diagnostics
-    Settings
-
-Required controls:
-
-    Connect / Disconnect
-    Start / Stop streaming
-    Select transport
-    Select quality preset
-    Select resolution
-    Open Windows display settings
-    Export logs
-
-Postpone:
-
-    Touch input
-    Keyboard / mouse forwarding
-    Audio streaming
-    Multi-tablet support
-    Cloud relay
-    Full display arrangement editor
-
----
-
-## 9.2 Tablet MVP
-
-Required screens:
-
-    Waiting / Pairing screen
-    Fullscreen display screen
-    Control overlay
-    Diagnostics screen
-    Settings screen
-
-Required controls:
-
-    Pairing code
-    Reconnect
-    Disconnect
-    Fit screen
-    Debug overlay toggle
-    Keep screen awake
-
-Postpone:
-
-    Touch input
-    Gesture control
-    On-screen keyboard
-    Audio
-    QR pairing
-    Custom themes
-
----
-
-# 10. Recommended UI Stack
-
-Desktop:
-
-    Tauri
-    React
-    TypeScript
-    Tailwind CSS
-    shadcn/ui
-    Zustand
-
-Tablet:
-
-    Native HarmonyOS / Android-style UI
-    Native video rendering surface
-    Minimal overlay components
-
-Reason:
-
-    Desktop needs a modern control panel.
-    Tablet needs reliable fullscreen rendering more than complex UI.
-
----
-
-# 11. Final Direction
-
-The product should not look like a remote desktop app full of controls.
-
-It should look like a clean display utility.
-
-Best first version:
-
-    Desktop:
-    A professional control panel with clear status cards.
-
-    Tablet:
-    A quiet fullscreen receiver with only one floating control button.
-
-Most important design sentence:
-
-    Make connection state obvious, make streaming controls simple, and make failures diagnosable.

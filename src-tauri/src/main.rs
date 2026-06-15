@@ -14,7 +14,9 @@ use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Emitter, State};
+use tauri::menu::{CheckMenuItemBuilder, MenuBuilder, MenuItemBuilder, SubmenuBuilder};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{BOOL, LPARAM, RECT};
 use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1};
@@ -28,12 +30,18 @@ mod protocol;
 const DEFAULT_HDC: &str =
     r"D:\Program\Huawei\DevEco Studio\sdk\default\openharmony\toolchains\hdc.exe";
 const DEFAULT_FFMPEG: &str = r"D:\Program\ffmpeg-8.1.1\bin\ffmpeg.exe";
-const NATIVE_TARGET_BITRATE: &str = "35M";
-const NATIVE_TARGET_BUFSIZE: &str = "1M";
-const NATIVE_TARGET_GOP_60: u32 = 6;
+const NATIVE_TARGET_BITRATE: &str = "20M";
+const NATIVE_TARGET_BUFSIZE: &str = "256K";
+const NATIVE_TARGET_GOP_60: u32 = 4;
 const HOST_SENDER_QUEUE_CAPACITY: usize = 1;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+const MENU_OPEN: &str = "open";
+const MENU_START: &str = "start";
+const MENU_STOP: &str = "stop";
+const MENU_REFRESH_DISPLAYS: &str = "refresh_displays";
+const MENU_EXIT: &str = "exit";
+const MENU_DISPLAY_PREFIX: &str = "display:";
 
 #[derive(Clone, Serialize)]
 struct DisplayInfo {
@@ -205,6 +213,9 @@ struct StreamRuntime {
 struct AppStateInner {
     stats: StreamStats,
     runtime: Option<StreamRuntime>,
+    last_config: Option<StreamConfig>,
+    selected_display_id: Option<usize>,
+    exiting: bool,
 }
 
 struct AppState(Arc<Mutex<AppStateInner>>);
@@ -224,8 +235,18 @@ fn get_defaults() -> Defaults {
 }
 
 #[tauri::command]
-fn list_displays() -> Result<Vec<DisplayInfo>, String> {
-    enumerate_displays()
+fn list_displays(state: State<AppState>) -> Result<Vec<DisplayInfo>, String> {
+    let displays = enumerate_displays()?;
+    {
+        let mut guard = state
+            .0
+            .lock()
+            .map_err(|_| "state lock poisoned".to_string())?;
+        if guard.selected_display_id.is_none() {
+            guard.selected_display_id = displays.first().map(|display| display.id);
+        }
+    }
+    Ok(displays)
 }
 
 #[tauri::command]
@@ -250,12 +271,25 @@ fn get_stream_stats(state: State<AppState>) -> Result<StreamStats, String> {
 }
 
 #[tauri::command]
+fn select_display(app: AppHandle, state: State<AppState>, display_id: usize) -> Result<(), String> {
+    set_selected_display(&app, &state, display_id)
+}
+
+#[tauri::command]
 fn start_stream(
     app: AppHandle,
     state: State<AppState>,
     config: StreamConfig,
 ) -> Result<(), String> {
-    stop_existing_stream(&state)?;
+    start_stream_with_state(app, &state, config)
+}
+
+fn start_stream_with_state(
+    app: AppHandle,
+    state: &AppState,
+    config: StreamConfig,
+) -> Result<(), String> {
+    stop_existing_stream(state)?;
 
     let displays = enumerate_displays()?;
     let display = displays
@@ -282,14 +316,17 @@ fn start_stream(
             ffmpeg_command: quote_command(&command),
             ..StreamStats::default()
         };
+        guard.selected_display_id = Some(config.display_id);
+        guard.last_config = Some(config.clone());
     }
 
     let state_for_thread = state.0.clone();
     let stop_for_thread = stop.clone();
     let child_for_thread = child_slot.clone();
+    let app_for_thread = app.clone();
     let handle = thread::spawn(move || {
         stream_thread(
-            app,
+            app_for_thread,
             state_for_thread,
             stop_for_thread,
             child_for_thread,
@@ -314,7 +351,11 @@ fn start_stream(
 
 #[tauri::command]
 fn stop_stream(state: State<AppState>, hdc_path: Option<String>) -> Result<(), String> {
-    stop_existing_stream(&state)?;
+    stop_stream_with_state(&state, hdc_path)
+}
+
+fn stop_stream_with_state(state: &AppState, hdc_path: Option<String>) -> Result<(), String> {
+    stop_existing_stream(state)?;
     if let Some(path) = hdc_path {
         if !path.trim().is_empty() {
             close_hdc_forward(&path)?;
@@ -323,7 +364,7 @@ fn stop_stream(state: State<AppState>, hdc_path: Option<String>) -> Result<(), S
     Ok(())
 }
 
-fn stop_existing_stream(state: &State<AppState>) -> Result<(), String> {
+fn stop_existing_stream(state: &AppState) -> Result<(), String> {
     let runtime = {
         let mut guard = state
             .0
@@ -687,7 +728,7 @@ fn looks_like_default_profile(config: &StreamConfig) -> bool {
         && config.gop == NATIVE_TARGET_GOP_60
         && matches!(
             config.bitrate.trim().to_ascii_uppercase().as_str(),
-            "35M" | "55M" | "70M" | "80M"
+            "20M" | "35M" | "55M" | "70M" | "80M"
         )
 }
 
@@ -698,9 +739,9 @@ fn recovery_gop_for_resolution(config: &StreamConfig, display: &DisplayInfo) -> 
     if pixels <= 2800 * 1840 {
         // Low-latency streaming, like Sunshine/Moonlight, keeps recovery tight enough that
         // dropped inter frames do not stay visible for multiple interaction frames.
-        fps.saturating_add(9) / 10
+        fps.saturating_add(14) / 15
     } else {
-        fps.saturating_add(4) / 5
+        fps.saturating_add(9) / 10
     }
     .max(1)
 }
@@ -1075,10 +1116,10 @@ fn run_stream_loop(
         .stdout
         .take()
         .ok_or_else(|| "ffmpeg stdout unavailable".to_string())?;
-    let (stdout_tx, stdout_rx) = mpsc::channel::<Result<Vec<u8>, String>>();
+    let (stdout_tx, stdout_rx) = mpsc::sync_channel::<Result<Vec<u8>, String>>(1);
     let stdout_reader_handle = thread::spawn(move || {
         let mut stdout = stdout;
-        let mut read_buffer = [0u8; 256 * 1024];
+        let mut read_buffer = [0u8; 64 * 1024];
         loop {
             match stdout.read(&mut read_buffer) {
                 Ok(0) => break,
@@ -1855,7 +1896,7 @@ mod tests {
 
         let config = effective_stream_config(config, &display, "hevc_qsv");
 
-        assert_eq!(config.gop, 6);
+        assert_eq!(config.gop, 4);
     }
 
     #[test]
@@ -1865,7 +1906,7 @@ mod tests {
 
         let config = effective_stream_config(config, &virtual_display(), "hevc_nvenc");
 
-        assert_eq!(config.gop, 12);
+        assert_eq!(config.gop, 6);
     }
 
     #[test]
@@ -1895,16 +1936,10 @@ mod tests {
     }
 
     #[test]
-    fn native_target_bitrate_uses_transport_safe_native_profile() {
-        let pixels_1440p = 2560.0 * 1440.0;
-        let pixels_4k = 3840.0 * 2160.0;
-        let pixels_native = 2800.0 * 1840.0;
-        let factor: f64 =
-            ((pixels_native - pixels_1440p) / (pixels_4k - pixels_1440p)) * 20.0 + 20.0;
-        let bitrate_mbps = (factor * 2.0).round() as u32;
-
-        assert_eq!(bitrate_mbps, 53);
-        assert_eq!(NATIVE_TARGET_BITRATE, "35M");
+    fn native_target_bitrate_uses_low_latency_native_profile() {
+        assert_eq!(NATIVE_TARGET_BITRATE, "20M");
+        assert_eq!(NATIVE_TARGET_BUFSIZE, "256K");
+        assert_eq!(NATIVE_TARGET_GOP_60, 4);
     }
 
     #[test]
@@ -1944,7 +1979,10 @@ mod tests {
     fn send_pacer_caps_added_latency_per_packet() {
         let pacer = SendPacer::new(true, 35_000, 60);
 
-        assert_eq!(pacer.target_delay_for_sent(pacer.burst_bytes), Duration::ZERO);
+        assert_eq!(
+            pacer.target_delay_for_sent(pacer.burst_bytes),
+            Duration::ZERO
+        );
         assert!(pacer.target_delay_for_sent(pacer.burst_bytes + 16 * 1024) > Duration::ZERO);
         assert_eq!(
             pacer.target_delay_for_sent(pacer.burst_bytes + 512 * 1024),
@@ -1965,11 +2003,17 @@ mod tests {
     fn realtime_queue_drops_oldest_stale_delta_first() {
         let queue = SenderQueue::new(2);
         assert!(matches!(
-            queue.push(test_packet(1, protocol::FLAG_VCL | protocol::FLAG_DROPPABLE)),
+            queue.push(test_packet(
+                1,
+                protocol::FLAG_VCL | protocol::FLAG_DROPPABLE
+            )),
             QueuePushResult::Queued
         ));
         assert!(matches!(
-            queue.push(test_packet(2, protocol::FLAG_VCL | protocol::FLAG_DROPPABLE)),
+            queue.push(test_packet(
+                2,
+                protocol::FLAG_VCL | protocol::FLAG_DROPPABLE
+            )),
             QueuePushResult::Queued
         ));
 
@@ -1978,7 +2022,10 @@ mod tests {
             protocol::FLAG_VCL | protocol::FLAG_DROPPABLE,
         ));
 
-        assert!(matches!(result, QueueRealtimePushResult::Queued { dropped: 1 }));
+        assert!(matches!(
+            result,
+            QueueRealtimePushResult::Queued { dropped: 1 }
+        ));
         let guard = queue.inner.lock().expect("queue lock");
         let sequences = guard
             .packets
@@ -2029,12 +2076,13 @@ mod tests {
             QueuePushResult::Queued
         ));
 
-        let result = queue.push_realtime(test_packet(
-            3,
-            protocol::FLAG_KEYFRAME | protocol::FLAG_VCL,
-        ));
+        let result =
+            queue.push_realtime(test_packet(3, protocol::FLAG_KEYFRAME | protocol::FLAG_VCL));
 
-        assert!(matches!(result, QueueRealtimePushResult::Queued { dropped: 2 }));
+        assert!(matches!(
+            result,
+            QueueRealtimePushResult::Queued { dropped: 2 }
+        ));
         let guard = queue.inner.lock().expect("queue lock");
         let sequences = guard
             .packets
@@ -2587,17 +2635,245 @@ fn find_start_code(buffer: &[u8], start: usize) -> Option<(usize, usize)> {
     None
 }
 
+fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
+    let menu = build_tray_menu(app.handle())?;
+    let mut builder = TrayIconBuilder::with_id("main")
+        .menu(&menu)
+        .tooltip("SideSlate")
+        .show_menu_on_left_click(false)
+        .on_menu_event(handle_tray_menu_event)
+        .on_tray_icon_event(|tray, event| {
+            if matches!(
+                event,
+                TrayIconEvent::DoubleClick {
+                    button: MouseButton::Left,
+                    ..
+                } | TrayIconEvent::Click {
+                    button: MouseButton::Left,
+                    button_state: MouseButtonState::Up,
+                    ..
+                }
+            ) {
+                show_main_window(tray.app_handle());
+            }
+        });
+
+    if let Some(icon) = app.default_window_icon().cloned() {
+        builder = builder.icon(icon);
+    }
+
+    builder.build(app)?;
+    Ok(())
+}
+
+fn build_tray_menu<M: Manager<tauri::Wry>>(
+    manager: &M,
+) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
+    let app = manager.app_handle();
+    let displays = enumerate_displays().unwrap_or_default();
+    let selected_display_id = app
+        .state::<AppState>()
+        .0
+        .lock()
+        .map(|guard| {
+            guard
+                .last_config
+                .as_ref()
+                .map(|config| config.display_id)
+                .or(guard.selected_display_id)
+        })
+        .unwrap_or(None);
+
+    let mut display_menu = SubmenuBuilder::new(manager, "Display");
+    if displays.is_empty() {
+        let item = MenuItemBuilder::with_id("display:none", "No displays found")
+            .enabled(false)
+            .build(manager)?;
+        display_menu = display_menu.item(&item);
+    } else {
+        for display in displays {
+            let id = format!("{}{}", MENU_DISPLAY_PREFIX, display.id);
+            let label = format!(
+                "{}{} ({}x{})",
+                if display.primary { "Primary - " } else { "" },
+                display.name,
+                display.width,
+                display.height
+            );
+            let item = CheckMenuItemBuilder::with_id(id, label)
+                .checked(selected_display_id == Some(display.id))
+                .build(manager)?;
+            display_menu = display_menu.item(&item);
+        }
+    }
+    let display_menu = display_menu.build()?;
+
+    MenuBuilder::new(manager)
+        .text(MENU_OPEN, "Open SideSlate")
+        .separator()
+        .text(MENU_START, "Start Streaming")
+        .text(MENU_STOP, "Stop Streaming")
+        .item(&display_menu)
+        .text(MENU_REFRESH_DISPLAYS, "Refresh Displays")
+        .separator()
+        .text(MENU_EXIT, "Exit")
+        .build()
+}
+
+fn handle_tray_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
+    let id = event.id().as_ref();
+    let result = if id == MENU_OPEN {
+        show_main_window(app);
+        Ok(())
+    } else if id == MENU_START {
+        start_stream_from_tray(app)
+    } else if id == MENU_STOP {
+        let state = app.state::<AppState>();
+        let hdc_path = state
+            .0
+            .lock()
+            .ok()
+            .and_then(|guard| {
+                guard
+                    .last_config
+                    .as_ref()
+                    .map(|config| config.hdc_path.clone())
+            })
+            .or_else(|| Some(DEFAULT_HDC.to_string()));
+        stop_stream_with_state(&state, hdc_path)
+    } else if id == MENU_REFRESH_DISPLAYS {
+        Ok(())
+    } else if id == MENU_EXIT {
+        request_app_exit(app)
+    } else if let Some(display_id) = id.strip_prefix(MENU_DISPLAY_PREFIX) {
+        let state = app.state::<AppState>();
+        display_id
+            .parse::<usize>()
+            .map_err(|error| error.to_string())
+            .and_then(|display_id| set_selected_display(app, &state, display_id))
+    } else {
+        Ok(())
+    };
+
+    if let Err(error) = result {
+        let _ = app.emit("tray-error", error);
+    }
+}
+
+fn start_stream_from_tray(app: &AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let config = {
+        let guard = state
+            .0
+            .lock()
+            .map_err(|_| "state lock poisoned".to_string())?;
+        guard
+            .last_config
+            .clone()
+            .unwrap_or_else(|| default_stream_config(guard.selected_display_id.unwrap_or(0)))
+    };
+    start_stream_with_state(app.clone(), &state, config)
+}
+
+fn set_selected_display(
+    app: &AppHandle,
+    state: &AppState,
+    display_id: usize,
+) -> Result<(), String> {
+    let displays = enumerate_displays()?;
+    if !displays.iter().any(|display| display.id == display_id) {
+        return Err(format!("display {} not found", display_id));
+    }
+
+    {
+        let mut guard = state
+            .0
+            .lock()
+            .map_err(|_| "state lock poisoned".to_string())?;
+        guard.selected_display_id = Some(display_id);
+        if let Some(config) = guard.last_config.as_mut() {
+            config.display_id = display_id;
+        }
+    }
+
+    app.emit("display-selected", display_id)
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn default_stream_config(display_id: usize) -> StreamConfig {
+    StreamConfig {
+        hdc_path: DEFAULT_HDC.to_string(),
+        ffmpeg_path: DEFAULT_FFMPEG.to_string(),
+        encoder: "auto".to_string(),
+        capture_backend: "ddagrab".to_string(),
+        display_id,
+        fps: 60,
+        bitrate: NATIVE_TARGET_BITRATE.to_string(),
+        bufsize: NATIVE_TARGET_BUFSIZE.to_string(),
+        gop: NATIVE_TARGET_GOP_60,
+        send_pacing: false,
+        host: "127.0.0.1".to_string(),
+        port: 17005,
+    }
+}
+
+fn show_main_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
+fn request_app_exit(app: &AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    {
+        let mut guard = state
+            .0
+            .lock()
+            .map_err(|_| "state lock poisoned".to_string())?;
+        guard.exiting = true;
+    }
+    stop_existing_stream(&state)?;
+    app.exit(0);
+    Ok(())
+}
+
 fn main() {
     tauri::Builder::default()
         .manage(AppState(Arc::new(Mutex::new(AppStateInner {
             stats: StreamStats::default(),
             runtime: None,
+            last_config: None,
+            selected_display_id: None,
+            exiting: false,
         }))))
+        .setup(|app| {
+            setup_tray(app)?;
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                let should_hide = window
+                    .app_handle()
+                    .state::<AppState>()
+                    .0
+                    .lock()
+                    .map(|guard| !guard.exiting)
+                    .unwrap_or(true);
+                if should_hide {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             get_defaults,
             list_displays,
             list_hdc_targets,
             setup_hdc_forward,
+            select_display,
             start_stream,
             stop_stream,
             get_stream_stats
