@@ -34,7 +34,15 @@ const DEFAULT_FFMPEG: &str = r"D:\Program\ffmpeg-8.1.1\bin\ffmpeg.exe";
 const NATIVE_TARGET_BITRATE: &str = "20M";
 const NATIVE_TARGET_BUFSIZE: &str = "256K";
 const NATIVE_TARGET_GOP_60: u32 = 4;
+// GOP tuning notes from local testing:
+// - This Intel iGPU + Parsec virtual display path showed heavy keyframe pressure at
+//   native 2800x1840@60 with GOP 4; manually trying GOP 8-12 is a reasonable next test.
+// - NVIDIA NVENC: keep GOP 4 first; NVENC handled the aggressive recovery target better.
+// - Stronger Intel/Arc or lower resolutions: try GOP 6-8 before going as long as GOP 12.
+// - Weak iGPU or high-resolution tablet: try GOP 15-30, then lower FPS/resolution if needed.
 const HOST_SENDER_QUEUE_CAPACITY: usize = 1;
+const MIN_IDLE_FLUSH_MS: u64 = 4;
+const MAX_IDLE_FLUSH_MS: u64 = 12;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 const MENU_OPEN: &str = "open";
@@ -100,6 +108,7 @@ struct StreamStats {
     ffmpeg_reads: u64,
     ffmpeg_read_bytes: u64,
     parser_buffer_bytes: u64,
+    current_max_read_gap_ms: f64,
     max_read_gap_ms: f64,
     socket_write_blocked_events: u64,
     socket_write_blocked_ms: f64,
@@ -113,6 +122,7 @@ struct StreamStats {
     resync_dropped_access_units: u64,
     bottleneck: String,
     effective_capture_backend: String,
+    video_pipeline: String,
     receiver_running: bool,
     receiver_decoder_started: bool,
     receiver_surface_ready: bool,
@@ -121,7 +131,9 @@ struct StreamStats {
     receiver_queued_inputs: u64,
     receiver_rendered_outputs: u64,
     receiver_dropped_packets: u64,
+    receiver_window_dropped_packets: u64,
     receiver_sequence_gaps: u64,
+    receiver_window_sequence_gaps: u64,
     receiver_config_packets: u64,
     receiver_keyframes: u64,
     receiver_last_sequence: u32,
@@ -137,6 +149,12 @@ struct StreamStats {
     receiver_max_receive_gap_ms: f64,
     receiver_max_input_gap_ms: f64,
     receiver_max_render_gap_ms: f64,
+    receiver_latest_receive_to_input_ms: f64,
+    receiver_latest_input_to_render_ms: f64,
+    receiver_latest_receive_to_render_ms: f64,
+    receiver_max_receive_to_input_ms: f64,
+    receiver_max_input_to_render_ms: f64,
+    receiver_max_receive_to_render_ms: f64,
     elapsed_seconds: f64,
     last_error: String,
 }
@@ -163,6 +181,7 @@ impl Default for StreamStats {
             ffmpeg_reads: 0,
             ffmpeg_read_bytes: 0,
             parser_buffer_bytes: 0,
+            current_max_read_gap_ms: 0.0,
             max_read_gap_ms: 0.0,
             socket_write_blocked_events: 0,
             socket_write_blocked_ms: 0.0,
@@ -176,6 +195,7 @@ impl Default for StreamStats {
             resync_dropped_access_units: 0,
             bottleneck: "idle".to_string(),
             effective_capture_backend: String::new(),
+            video_pipeline: String::new(),
             receiver_running: false,
             receiver_decoder_started: false,
             receiver_surface_ready: false,
@@ -184,7 +204,9 @@ impl Default for StreamStats {
             receiver_queued_inputs: 0,
             receiver_rendered_outputs: 0,
             receiver_dropped_packets: 0,
+            receiver_window_dropped_packets: 0,
             receiver_sequence_gaps: 0,
+            receiver_window_sequence_gaps: 0,
             receiver_config_packets: 0,
             receiver_keyframes: 0,
             receiver_last_sequence: 0,
@@ -200,6 +222,12 @@ impl Default for StreamStats {
             receiver_max_receive_gap_ms: 0.0,
             receiver_max_input_gap_ms: 0.0,
             receiver_max_render_gap_ms: 0.0,
+            receiver_latest_receive_to_input_ms: 0.0,
+            receiver_latest_input_to_render_ms: 0.0,
+            receiver_latest_receive_to_render_ms: 0.0,
+            receiver_max_receive_to_input_ms: 0.0,
+            receiver_max_input_to_render_ms: 0.0,
+            receiver_max_receive_to_render_ms: 0.0,
             elapsed_seconds: 0.0,
             last_error: String::new(),
         }
@@ -448,10 +476,10 @@ fn start_stream_with_state(
         .cloned()
         .ok_or_else(|| format!("display {} not found", config.display_id))?;
 
-    persist_stream_config(&app, state, config.clone(), &display)?;
-    let encoder = choose_encoder(&config.ffmpeg_path, &config.encoder)?;
+    let encoder = choose_encoder(&config.ffmpeg_path, &config.encoder, &display)?;
     let config = effective_stream_config(config, &display, &encoder);
     let command = build_ffmpeg_command(&config, &display, &encoder)?;
+    persist_stream_config(&app, state, config.clone(), &display)?;
     let stop = Arc::new(AtomicBool::new(false));
     let child_slot = Arc::new(Mutex::new(None));
 
@@ -801,7 +829,18 @@ fn encoder_works(ffmpeg: &str, encoder: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn choose_encoder(ffmpeg: &str, requested: &str) -> Result<String, String> {
+fn auto_encoder_preference(display: &DisplayInfo) -> [&'static str; 3] {
+    let adapter = display.dxgi_adapter_name.to_ascii_lowercase();
+    let device = display.device_string.to_ascii_lowercase();
+    let text = format!("{} {}", adapter, device);
+    if text.contains("intel") {
+        ["hevc_qsv", "hevc_nvenc", "libx265"]
+    } else {
+        ["hevc_nvenc", "hevc_qsv", "libx265"]
+    }
+}
+
+fn choose_encoder(ffmpeg: &str, requested: &str, display: &DisplayInfo) -> Result<String, String> {
     if requested != "auto" {
         if encoder_works(ffmpeg, requested) {
             return Ok(requested.to_string());
@@ -813,7 +852,7 @@ fn choose_encoder(ffmpeg: &str, requested: &str) -> Result<String, String> {
     }
 
     let encoders = available_encoders(ffmpeg)?;
-    for encoder in ["hevc_nvenc", "hevc_qsv", "libx265"] {
+    for encoder in auto_encoder_preference(display) {
         if encoders.contains(encoder) && encoder_works(ffmpeg, encoder) {
             return Ok(encoder.to_string());
         }
@@ -877,10 +916,10 @@ fn apply_default_low_latency_profile(mut config: StreamConfig, encoder: &str) ->
 
 fn looks_like_default_profile(config: &StreamConfig) -> bool {
     config.fps == 60
-        && config.gop == NATIVE_TARGET_GOP_60
+        && matches!(config.gop, 4 | 6 | 8)
         && matches!(
             config.bitrate.trim().to_ascii_uppercase().as_str(),
-            "20M" | "35M" | "55M" | "70M" | "80M"
+            "12M" | "20M" | "35M" | "55M" | "70M" | "80M"
         )
 }
 
@@ -889,8 +928,8 @@ fn recovery_gop_for_resolution(config: &StreamConfig, display: &DisplayInfo) -> 
     let pixels = width.saturating_mul(height);
     let fps = config.fps.max(1);
     if pixels <= 2800 * 1840 {
-        // Low-latency streaming, like Sunshine/Moonlight, keeps recovery tight enough that
-        // dropped inter frames do not stay visible for multiple interaction frames.
+        // Keep recovery tight enough that dropped inter frames do not stay visible for multiple
+        // interaction frames while preserving the higher-quality profile that maintained cadence.
         fps.saturating_add(14) / 15
     } else {
         fps.saturating_add(9) / 10
@@ -928,6 +967,24 @@ fn use_gpu_resident_dxgi(config: &StreamConfig, encoder: &str) -> bool {
         "ddagrab_zero_copy" => matches!(encoder, "hevc_nvenc" | "hevc_qsv"),
         "ddagrab" => matches!(encoder, "hevc_nvenc" | "hevc_qsv"),
         _ => false,
+    }
+}
+
+fn use_nvenc_d3d11_input(config: &StreamConfig, encoder: &str) -> bool {
+    matches!(encoder, "hevc_nvenc") && use_gpu_resident_dxgi(config, encoder)
+}
+
+fn video_pipeline_name(config: &StreamConfig, encoder: &str) -> &'static str {
+    if use_nvenc_d3d11_input(config, encoder) {
+        "d3d11-nvenc"
+    } else if matches!(encoder, "hevc_qsv") && use_gpu_resident_dxgi(config, encoder) {
+        "d3d11-qsv"
+    } else if is_dxgi_capture(&config.capture_backend) {
+        "dxgi-cpu-download"
+    } else if config.capture_backend == "gfxcapture" {
+        "wgc-cpu-download"
+    } else {
+        "gdi-cpu"
     }
 }
 
@@ -982,6 +1039,8 @@ fn build_ffmpeg_command(
         "0".into(),
         "-fflags".into(),
         "nobuffer".into(),
+        "-avioflags".into(),
+        "direct".into(),
         "-flags".into(),
         "low_delay".into(),
     ];
@@ -1045,7 +1104,10 @@ fn build_ffmpeg_command(
     let mut effective_config = config.clone();
     effective_config.capture_backend = capture_backend.clone();
     let gpu_resident_dxgi = use_gpu_resident_dxgi(&effective_config, encoder);
-    if gpu_resident_dxgi && encoder == "hevc_qsv" {
+    if use_nvenc_d3d11_input(&effective_config, encoder) {
+        // Let NVENC consume the D3D11 frames from ddagrab directly. The compatibility
+        // capture mode below keeps the old CPU-download path available.
+    } else if gpu_resident_dxgi && encoder == "hevc_qsv" {
         filters.push("hwmap=derive_device=qsv".to_string());
         filters.push("scale_qsv=format=nv12".to_string());
     } else if capture_backend != "gdigrab" {
@@ -1119,8 +1181,6 @@ fn build_ffmpeg_command(
             config.gop.to_string(),
             "-bf".into(),
             "0".into(),
-            "-look_ahead".into(),
-            "0".into(),
             "-look_ahead_depth".into(),
             "0".into(),
         ]),
@@ -1151,6 +1211,10 @@ fn build_ffmpeg_command(
         "cfr".into(),
         "-r".into(),
         config.fps.to_string(),
+        "-muxdelay".into(),
+        "0".into(),
+        "-muxpreload".into(),
+        "0".into(),
         "-flush_packets".into(),
         "1".into(),
         "-f".into(),
@@ -1158,6 +1222,41 @@ fn build_ffmpeg_command(
         "pipe:1".into(),
     ]);
     Ok(command)
+}
+
+fn nvenc_compat_fallback(
+    config: &StreamConfig,
+    display: &DisplayInfo,
+    encoder: &str,
+    error: &str,
+) -> Option<(StreamConfig, Vec<String>)> {
+    if encoder != "hevc_nvenc"
+        || !matches!(
+            config.capture_backend.as_str(),
+            "ddagrab" | "ddagrab_zero_copy"
+        )
+    {
+        return None;
+    }
+    let lower = error.to_ascii_lowercase();
+    let looks_like_interop_failure = [
+        "ffmpeg exited",
+        "could not open encoder",
+        "error while opening encoder",
+        "function not implemented",
+        "operation not permitted",
+        "d3d11",
+        "nvenc",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+    if !looks_like_interop_failure {
+        return None;
+    }
+    let mut fallback_config = config.clone();
+    fallback_config.capture_backend = "ddagrab_compat".to_string();
+    let fallback_command = build_ffmpeg_command(&fallback_config, display, encoder).ok()?;
+    Some((fallback_config, fallback_command))
 }
 
 fn stream_thread(
@@ -1170,7 +1269,7 @@ fn stream_thread(
     command: Vec<String>,
     encoder: String,
 ) {
-    let result = run_stream_loop(
+    let mut result = run_stream_loop(
         &app,
         &state,
         &stop,
@@ -1180,6 +1279,36 @@ fn stream_thread(
         &command,
         &encoder,
     );
+    if let Err(error) = &result {
+        if !stop.load(Ordering::SeqCst) {
+            if let Some((fallback_config, fallback_command)) =
+                nvenc_compat_fallback(&config, &display, &encoder, error)
+            {
+                if let Ok(mut guard) = state.lock() {
+                    guard.stats.status = "retrying NVENC compatibility path".to_string();
+                    guard.stats.ffmpeg_command = quote_command(&fallback_command);
+                    guard.stats.effective_capture_backend = fallback_config.capture_backend.clone();
+                    guard.stats.video_pipeline =
+                        video_pipeline_name(&fallback_config, &encoder).to_string();
+                    guard.stats.last_error = format!(
+                        "NVENC D3D11 path failed, retrying compatibility path: {}",
+                        error
+                    );
+                    let _ = app.emit("stream-stats", guard.stats.clone());
+                }
+                result = run_stream_loop(
+                    &app,
+                    &state,
+                    &stop,
+                    &child_slot,
+                    &fallback_config,
+                    &display,
+                    &fallback_command,
+                    &encoder,
+                );
+            }
+        }
+    }
     let mut guard = match state.lock() {
         Ok(guard) => guard,
         Err(_) => return,
@@ -1325,6 +1454,7 @@ fn run_stream_loop(
     let mut ffmpeg_reads = 0u64;
     let mut ffmpeg_read_bytes = 0u64;
     let mut max_read_gap_ms = 0.0;
+    let mut window_max_read_gap_ms = 0.0;
     let mut last_read: Option<Instant> = None;
     let bitrate_kbps = parse_size_to_kbits(&config.bitrate);
     let send_pacer = SendPacer::new(config.send_pacing, bitrate_kbps, config.fps);
@@ -1340,23 +1470,25 @@ fn run_stream_loop(
     let mut last_sent_bytes = 0u64;
     let mut last_socket_write_blocked_events = 0u64;
     let mut last_socket_write_blocked_ms = 0.0;
+    let mut last_receiver_dropped_packets = 0u64;
+    let mut last_receiver_sequence_gaps = 0u64;
     let mut access_unit_parser = HevcAccessUnitParser::default();
     let frame_duration_us = 1_000_000u64 / config.fps.max(1) as u64;
     let mut video_frame_index = 0u64;
-    let idle_flush_interval =
-        Duration::from_millis((2000u64 / config.fps.max(1) as u64).clamp(50, 200));
+    let idle_flush_interval = access_unit_idle_flush_interval(config.fps);
     let stats_interval = Duration::from_millis(500);
     let mut log_file = open_stream_log();
     write_stream_log(
         &mut log_file,
         &format!(
-            "START encoder={} bitrate={} bufsize={} gop={} fps={} capture={} display={} device=\"{}\" virtual={} dxgi_adapter={:?} dxgi_output={:?} dxgi_adapter_name=\"{}\" output={}x{} pacing={} command={}",
+            "START encoder={} bitrate={} bufsize={} gop={} fps={} capture={} pipeline={} display={} device=\"{}\" virtual={} dxgi_adapter={:?} dxgi_output={:?} dxgi_adapter_name=\"{}\" output={}x{} pacing={} command={}",
             encoder,
             config.bitrate,
             config.bufsize,
             config.gop,
             config.fps,
             config.capture_backend,
+            video_pipeline_name(config, encoder),
             display.name,
             display.device_string,
             display.virtual_display,
@@ -1378,6 +1510,7 @@ fn run_stream_loop(
                 if let Some(previous_read) = last_read {
                     let read_gap_ms = now.duration_since(previous_read).as_secs_f64() * 1000.0;
                     max_read_gap_ms = f64::max(max_read_gap_ms, read_gap_ms);
+                    window_max_read_gap_ms = f64::max(window_max_read_gap_ms, read_gap_ms);
                 }
                 last_read = Some(now);
                 ffmpeg_reads += 1;
@@ -1451,6 +1584,14 @@ fn run_stream_loop(
                 .saturating_sub(last_socket_write_blocked_events);
             let window_socket_write_blocked_ms =
                 (sender.socket_write_blocked_ms - last_socket_write_blocked_ms).max(0.0);
+            let window_receiver_dropped_packets = receiver
+                .stats
+                .dropped_packets
+                .saturating_sub(last_receiver_dropped_packets);
+            let window_receiver_sequence_gaps = receiver
+                .stats
+                .sequence_gaps
+                .saturating_sub(last_receiver_sequence_gaps);
             let mut guard = state
                 .lock()
                 .map_err(|_| "state lock poisoned".to_string())?;
@@ -1472,6 +1613,7 @@ fn run_stream_loop(
             guard.stats.ffmpeg_reads = ffmpeg_reads;
             guard.stats.ffmpeg_read_bytes = ffmpeg_read_bytes;
             guard.stats.parser_buffer_bytes = access_unit_parser.buffer_len() as u64;
+            guard.stats.current_max_read_gap_ms = window_max_read_gap_ms;
             guard.stats.max_read_gap_ms = max_read_gap_ms;
             guard.stats.socket_write_blocked_events = window_socket_write_blocked_events;
             guard.stats.socket_write_blocked_ms = window_socket_write_blocked_ms;
@@ -1484,7 +1626,10 @@ fn run_stream_loop(
             guard.stats.resync_events = resync_events;
             guard.stats.resync_dropped_access_units = resync_dropped_access_units;
             guard.stats.effective_capture_backend = config.capture_backend.clone();
+            guard.stats.video_pipeline = video_pipeline_name(config, encoder).to_string();
             apply_receiver_metrics(&mut guard.stats, &receiver);
+            guard.stats.receiver_window_dropped_packets = window_receiver_dropped_packets;
+            guard.stats.receiver_window_sequence_gaps = window_receiver_sequence_gaps;
             guard.stats.bottleneck = classify_bottleneck(&guard.stats, config);
             if !sender.last_error.is_empty() {
                 guard.stats.last_error = sender.last_error.clone();
@@ -1500,33 +1645,43 @@ fn run_stream_loop(
             last_sent_bytes = sender.sent_bytes;
             last_socket_write_blocked_events = sender.socket_write_blocked_events;
             last_socket_write_blocked_ms = sender.socket_write_blocked_ms;
+            last_receiver_dropped_packets = receiver.stats.dropped_packets;
+            last_receiver_sequence_gaps = receiver.stats.sequence_gaps;
             window_max_packet_bytes = 0;
+            window_max_read_gap_ms = 0.0;
         }
     }
     sender_queue.close();
     let _ = sender_handle.join();
+    let user_requested_stop = stop.load(Ordering::SeqCst);
     stop.store(true, Ordering::SeqCst);
     let _ = receiver_stats_handle.join();
 
     let mut ffmpeg_status_error = None;
+    let mut ffmpeg_exit_status = None;
     if let Ok(mut guard) = child_slot.lock() {
         if let Some(mut child) = guard.take() {
-            if stop.load(Ordering::SeqCst) {
-                let _ = child.kill();
-                let _ = child.wait();
-            } else if ffmpeg_stdout_eof {
+            if ffmpeg_stdout_eof {
                 match child.wait() {
-                    Ok(status) if status.success() => {}
+                    Ok(status) if status.success() => {
+                        ffmpeg_exit_status = Some(status.to_string());
+                    }
                     Ok(status) => {
-                        ffmpeg_status_error = Some(format!("ffmpeg exited with {}", status));
+                        let status_text = status.to_string();
+                        ffmpeg_exit_status = Some(status_text.clone());
+                        ffmpeg_status_error = Some(format!("ffmpeg exited with {}", status_text));
                     }
                     Err(err) => {
                         ffmpeg_status_error = Some(format!("ffmpeg wait failed: {}", err));
                     }
                 }
+            } else if user_requested_stop {
+                let _ = child.kill();
+                let _ = child.wait();
             } else {
                 let _ = child.kill();
                 let _ = child.wait();
+                ffmpeg_status_error = Some("ffmpeg stdout ended unexpectedly".to_string());
             }
         }
     }
@@ -1539,11 +1694,62 @@ fn run_stream_loop(
             .lock()
             .map(|tail| tail.trim().to_string())
             .unwrap_or_default();
+        write_stream_log(
+            &mut log_file,
+            &format!(
+                "END error=\"{}\" ffmpeg_reads={} ffmpeg_bytes={} stderr=\"{}\"",
+                error,
+                ffmpeg_reads,
+                ffmpeg_read_bytes,
+                tail.replace('\n', "\\n")
+            ),
+        );
         if tail.is_empty() {
             return Err(error);
         }
         return Err(format!("{}. Recent ffmpeg stderr:\n{}", error, tail));
     }
+    if ffmpeg_stdout_eof && !user_requested_stop {
+        let status = ffmpeg_exit_status.unwrap_or_else(|| "unknown status".to_string());
+        let tail = stderr_tail
+            .lock()
+            .map(|tail| tail.trim().to_string())
+            .unwrap_or_default();
+        let error = if ffmpeg_reads == 0 {
+            format!("ffmpeg exited before producing stdout bytes ({})", status)
+        } else {
+            format!(
+                "ffmpeg exited unexpectedly after {} stdout reads / {} bytes ({})",
+                ffmpeg_reads, ffmpeg_read_bytes, status
+            )
+        };
+        write_stream_log(
+            &mut log_file,
+            &format!(
+                "END error=\"{}\" ffmpeg_reads={} ffmpeg_bytes={} stderr=\"{}\"",
+                error,
+                ffmpeg_reads,
+                ffmpeg_read_bytes,
+                tail.replace('\n', "\\n")
+            ),
+        );
+        if tail.is_empty() {
+            return Err(error);
+        }
+        return Err(format!("{}. Recent ffmpeg stderr:\n{}", error, tail));
+    }
+    write_stream_log(
+        &mut log_file,
+        &format!(
+            "END ok={} requested_stop={} stdout_eof={} ffmpeg_status={} ffmpeg_reads={} ffmpeg_bytes={}",
+            user_requested_stop || ffmpeg_stdout_eof,
+            user_requested_stop,
+            ffmpeg_stdout_eof,
+            ffmpeg_exit_status.unwrap_or_else(|| "not_waited".to_string()),
+            ffmpeg_reads,
+            ffmpeg_read_bytes
+        ),
+    );
     Ok(())
 }
 
@@ -1655,9 +1861,10 @@ fn write_stats_log(log_file: &mut Option<std::fs::File>, stats: &StreamStats) {
     write_stream_log(
         log_file,
         &format!(
-            "STAT elapsed={:.3} bottleneck=\"{}\" host_fps={:.2} host_mbps={:.2} host_current_fps={:.2} host_current_mbps={:.2} host_packets={} host_vcl={} host_keyframes={} max_packet={} window_max_packet={} max_keyframe={} max_delta={} ffmpeg_reads={} ffmpeg_read_bytes={} parser_buffer={} host_max_read_gap_ms={:.1} socket_stalls={} socket_stall_ms={:.1} max_socket_ms={:.1} paced={} paced_sleep_ms={:.1} max_send_ms={:.1} host_queue={} host_dropped={} resync_events={} resync_dropped={} capture={} receiver_running={} receiver_surface={} receiver_decoder={} receiver_packets={} receiver_bytes={} receiver_mbps={:.2} receiver_inputs={} receiver_input_fps={:.2} receiver_rendered={} receiver_render_fps={:.2} receiver_dropped={} receiver_drop_fps={:.2} receiver_queue={} receiver_seq_gaps={} receiver_config={} receiver_keyframes={} receiver_stream={}x{}@{} receiver_max_rx_gap_ms={:.1} receiver_max_input_gap_ms={:.1} receiver_max_render_gap_ms={:.1} receiver_last_error={}",
+            "STAT elapsed={:.3} bottleneck=\"{}\" pipeline={} host_fps={:.2} host_mbps={:.2} host_current_fps={:.2} host_current_mbps={:.2} host_packets={} host_vcl={} host_keyframes={} max_packet={} window_max_packet={} max_keyframe={} max_delta={} ffmpeg_reads={} ffmpeg_read_bytes={} parser_buffer={} host_window_read_gap_ms={:.1} host_max_read_gap_ms={:.1} socket_stalls={} socket_stall_ms={:.1} max_socket_ms={:.1} paced={} paced_sleep_ms={:.1} max_send_ms={:.1} host_queue={} host_dropped={} resync_events={} resync_dropped={} capture={} receiver_running={} receiver_surface={} receiver_decoder={} receiver_packets={} receiver_bytes={} receiver_mbps={:.2} receiver_inputs={} receiver_input_fps={:.2} receiver_rendered={} receiver_render_fps={:.2} receiver_dropped={} receiver_window_dropped={} receiver_drop_fps={:.2} receiver_queue={} receiver_seq_gaps={} receiver_window_seq_gaps={} receiver_config={} receiver_keyframes={} receiver_stream={}x{}@{} receiver_max_rx_gap_ms={:.1} receiver_max_input_gap_ms={:.1} receiver_max_render_gap_ms={:.1} receiver_latest_rx_to_input_ms={:.1} receiver_latest_input_to_render_ms={:.1} receiver_latest_rx_to_render_ms={:.1} receiver_max_rx_to_input_ms={:.1} receiver_max_input_to_render_ms={:.1} receiver_max_rx_to_render_ms={:.1} receiver_last_error={}",
             stats.elapsed_seconds,
             stats.bottleneck,
+            stats.video_pipeline,
             stats.fps,
             stats.mbps,
             stats.current_fps,
@@ -1672,6 +1879,7 @@ fn write_stats_log(log_file: &mut Option<std::fs::File>, stats: &StreamStats) {
             stats.ffmpeg_reads,
             stats.ffmpeg_read_bytes,
             stats.parser_buffer_bytes,
+            stats.current_max_read_gap_ms,
             stats.max_read_gap_ms,
             stats.socket_write_blocked_events,
             stats.socket_write_blocked_ms,
@@ -1695,9 +1903,11 @@ fn write_stats_log(log_file: &mut Option<std::fs::File>, stats: &StreamStats) {
             stats.receiver_rendered_outputs,
             stats.receiver_render_fps,
             stats.receiver_dropped_packets,
+            stats.receiver_window_dropped_packets,
             stats.receiver_drop_fps,
             stats.receiver_queue_depth,
             stats.receiver_sequence_gaps,
+            stats.receiver_window_sequence_gaps,
             stats.receiver_config_packets,
             stats.receiver_keyframes,
             stats.receiver_stream_width,
@@ -1706,6 +1916,12 @@ fn write_stats_log(log_file: &mut Option<std::fs::File>, stats: &StreamStats) {
             stats.receiver_max_receive_gap_ms,
             stats.receiver_max_input_gap_ms,
             stats.receiver_max_render_gap_ms,
+            stats.receiver_latest_receive_to_input_ms,
+            stats.receiver_latest_input_to_render_ms,
+            stats.receiver_latest_receive_to_render_ms,
+            stats.receiver_max_receive_to_input_ms,
+            stats.receiver_max_input_to_render_ms,
+            stats.receiver_max_receive_to_render_ms,
             stats.receiver_last_error
         ),
     );
@@ -1723,7 +1939,9 @@ fn classify_bottleneck(stats: &StreamStats, config: &StreamConfig) -> String {
     if stats.host_dropped_packets > 0 || stats.resync_events > 0 {
         return "host queue overflow: sender fell behind and had to resync".to_string();
     }
-    if stats.max_read_gap_ms > frame_ms * 3.0 && stats.current_fps < config.fps as f64 * 0.85 {
+    if stats.current_max_read_gap_ms > frame_ms * 3.0
+        && stats.current_fps < config.fps as f64 * 0.85
+    {
         return "capture/encoder jitter: FFmpeg output has long frame gaps".to_string();
     }
     if receiver_has_stats
@@ -1744,7 +1962,7 @@ fn classify_bottleneck(stats: &StreamStats, config: &StreamConfig) -> String {
     {
         return "tablet render/decode: outputs are slower than decoder inputs".to_string();
     }
-    if stats.receiver_sequence_gaps > 0 || stats.receiver_dropped_packets > 0 {
+    if stats.receiver_window_sequence_gaps > 0 || stats.receiver_window_dropped_packets > 0 {
         return "receiver recovery: packet gaps or stale frames reached tablet".to_string();
     }
     "no obvious bottleneck in current sample".to_string()
@@ -1892,6 +2110,11 @@ fn video_timestamp_us(frame_index: u64, frame_duration_us: u64) -> u64 {
     frame_index.saturating_mul(frame_duration_us)
 }
 
+fn access_unit_idle_flush_interval(fps: u32) -> Duration {
+    let frame_ms = 1000u64 / fps.max(1) as u64;
+    Duration::from_millis((frame_ms / 2).clamp(MIN_IDLE_FLUSH_MS, MAX_IDLE_FLUSH_MS))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1931,6 +2154,24 @@ mod tests {
         }
     }
 
+    fn intel_display() -> DisplayInfo {
+        let mut display = virtual_display();
+        display.dxgi_adapter_name = "Intel(R) Arc(TM) Graphics".to_string();
+        display.device_string = "Intel internal display".to_string();
+        display
+    }
+
+    fn nvidia_display() -> DisplayInfo {
+        let mut display = virtual_display();
+        display.dxgi_adapter_name = "NVIDIA GeForce RTX".to_string();
+        display.device_string = "NVIDIA display".to_string();
+        display
+    }
+
+    fn write_test_f64(payload: &mut [u8], offset: usize, value: f64) {
+        payload[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
     #[test]
     fn ddagrab_command_uses_dxgi_mapping_not_display_id() {
         let command = build_ffmpeg_command(&test_config(), &virtual_display(), "hevc_nvenc")
@@ -1945,6 +2186,18 @@ mod tests {
         assert!(!command
             .windows(2)
             .any(|window| window[0] == "-i" && window[1].contains("ddagrab=output_idx=1:")));
+    }
+
+    #[test]
+    fn auto_encoder_preference_tracks_display_adapter() {
+        assert_eq!(
+            auto_encoder_preference(&intel_display()),
+            ["hevc_qsv", "hevc_nvenc", "libx265"]
+        );
+        assert_eq!(
+            auto_encoder_preference(&nvidia_display()),
+            ["hevc_nvenc", "hevc_qsv", "libx265"]
+        );
     }
 
     #[test]
@@ -1964,10 +2217,19 @@ mod tests {
 
         assert!(command
             .windows(2)
+            .any(|window| window[0] == "-avioflags" && window[1] == "direct"));
+        assert!(command
+            .windows(2)
             .any(|window| window[0] == "-fps_mode" && window[1] == "cfr"));
         assert!(command
             .windows(2)
             .any(|window| window[0] == "-r" && window[1] == config.fps.to_string()));
+        assert!(command
+            .windows(2)
+            .any(|window| window[0] == "-muxdelay" && window[1] == "0"));
+        assert!(command
+            .windows(2)
+            .any(|window| window[0] == "-muxpreload" && window[1] == "0"));
         assert!(command
             .windows(2)
             .any(|window| window[0] == "-strict_gop" && window[1] == "1"));
@@ -1990,6 +2252,85 @@ mod tests {
         assert!(filter.contains("scale_qsv=format=nv12"));
         assert!(!filter.contains("w="));
         assert!(!filter.contains("h="));
+        assert!(!command.iter().any(|part| part == "-look_ahead"));
+        assert!(!command.iter().any(|part| part == "-low_power"));
+        assert!(!command.iter().any(|part| part == "-max_frame_size_i"));
+        assert!(!command.iter().any(|part| part == "-max_frame_size_p"));
+    }
+
+    #[test]
+    fn nvenc_dxgi_command_keeps_frames_on_gpu() {
+        let mut config = test_config();
+        config.capture_backend = "ddagrab_zero_copy".to_string();
+        let command =
+            build_ffmpeg_command(&config, &virtual_display(), "hevc_nvenc").expect("command");
+
+        let filter = command
+            .windows(2)
+            .find_map(|window| (window[0] == "-vf").then_some(window[1].as_str()));
+
+        assert!(command
+            .windows(2)
+            .any(|window| { window[0] == "-init_hw_device" && window[1] == "d3d11va=t2s_dda:2" }));
+        assert!(match filter {
+            Some(filter) => !filter.contains("hwdownload"),
+            None => true,
+        });
+    }
+
+    #[test]
+    fn default_nvenc_dxgi_command_uses_d3d11_input() {
+        let config = test_config();
+        let command =
+            build_ffmpeg_command(&config, &virtual_display(), "hevc_nvenc").expect("command");
+        let filter = command
+            .windows(2)
+            .find_map(|window| (window[0] == "-vf").then_some(window[1].as_str()));
+
+        assert_eq!(video_pipeline_name(&config, "hevc_nvenc"), "d3d11-nvenc");
+        assert!(match filter {
+            Some(filter) => !filter.contains("hwdownload"),
+            None => true,
+        });
+    }
+
+    #[test]
+    fn nvenc_dxgi_compat_command_downloads_frames() {
+        let mut config = test_config();
+        config.capture_backend = "ddagrab_compat".to_string();
+        let command =
+            build_ffmpeg_command(&config, &virtual_display(), "hevc_nvenc").expect("command");
+        let filter = command
+            .windows(2)
+            .find_map(|window| (window[0] == "-vf").then_some(window[1].as_str()))
+            .expect("filter chain should exist");
+
+        assert!(filter.contains("hwdownload"));
+        assert!(filter.contains("format=bgra"));
+        assert!(filter.contains("format=yuv420p"));
+    }
+
+    #[test]
+    fn nvenc_d3d11_failure_has_compatibility_fallback() {
+        let config = test_config();
+        let (fallback_config, fallback_command) = nvenc_compat_fallback(
+            &config,
+            &virtual_display(),
+            "hevc_nvenc",
+            "ffmpeg exited with error while opening encoder",
+        )
+        .expect("fallback");
+        let filter = fallback_command
+            .windows(2)
+            .find_map(|window| (window[0] == "-vf").then_some(window[1].as_str()))
+            .expect("filter chain should exist");
+
+        assert_eq!(fallback_config.capture_backend, "ddagrab_compat");
+        assert_eq!(
+            video_pipeline_name(&fallback_config, "hevc_nvenc"),
+            "dxgi-cpu-download"
+        );
+        assert!(filter.contains("hwdownload"));
     }
 
     #[test]
@@ -2039,7 +2380,43 @@ mod tests {
     }
 
     #[test]
-    fn effective_config_bounds_1080p_recovery_to_sub_100ms_at_60fps() {
+    fn receiver_stats_parser_accepts_extended_latency_fields() {
+        let mut payload = vec![0u8; protocol::RECEIVER_STATS_EXTENDED_PAYLOAD_SIZE];
+        write_test_f64(&mut payload, 152, 1.25);
+        write_test_f64(&mut payload, 160, 2.5);
+        write_test_f64(&mut payload, 168, 3.75);
+        write_test_f64(&mut payload, 176, 4.25);
+        write_test_f64(&mut payload, 184, 5.5);
+        write_test_f64(&mut payload, 192, 6.75);
+
+        let stats = protocol::parse_receiver_stats_payload(&payload).expect("stats payload");
+
+        assert_eq!(stats.latest_receive_to_input_ms, 1.25);
+        assert_eq!(stats.latest_input_to_render_ms, 2.5);
+        assert_eq!(stats.latest_receive_to_render_ms, 3.75);
+        assert_eq!(stats.max_receive_to_input_ms, 4.25);
+        assert_eq!(stats.max_input_to_render_ms, 5.5);
+        assert_eq!(stats.max_receive_to_render_ms, 6.75);
+    }
+
+    #[test]
+    fn idle_flush_interval_stays_below_one_60fps_frame() {
+        assert_eq!(
+            access_unit_idle_flush_interval(60),
+            Duration::from_millis(8)
+        );
+        assert_eq!(
+            access_unit_idle_flush_interval(120),
+            Duration::from_millis(4)
+        );
+        assert_eq!(
+            access_unit_idle_flush_interval(30),
+            Duration::from_millis(12)
+        );
+    }
+
+    #[test]
+    fn effective_config_bounds_1080p_recovery_to_transport_friendly_gop() {
         let mut config = test_config();
         config.gop = 60;
         let mut display = virtual_display();
@@ -2048,11 +2425,11 @@ mod tests {
 
         let config = effective_stream_config(config, &display, "hevc_qsv");
 
-        assert_eq!(config.gop, 4);
+        assert_eq!(config.gop, NATIVE_TARGET_GOP_60);
     }
 
     #[test]
-    fn effective_config_uses_longer_recovery_for_above_tablet_native_resolution() {
+    fn effective_config_uses_longer_recovery_for_above_native_resolution() {
         let mut config = test_config();
         config.gop = 60;
 
@@ -2114,6 +2491,57 @@ mod tests {
         stats.resync_events = 1;
         let bottleneck = classify_bottleneck(&stats, &config);
         assert!(bottleneck.contains("host queue overflow"));
+    }
+
+    #[test]
+    fn bottleneck_classifier_uses_window_read_gap_not_stale_max() {
+        let config = test_config();
+        let stats = StreamStats {
+            running: true,
+            current_fps: 40.0,
+            max_read_gap_ms: 200.0,
+            current_max_read_gap_ms: 0.0,
+            ..StreamStats::default()
+        };
+
+        let bottleneck = classify_bottleneck(&stats, &config);
+        assert!(!bottleneck.contains("capture/encoder jitter"));
+
+        let stats = StreamStats {
+            current_max_read_gap_ms: 80.0,
+            ..stats
+        };
+        let bottleneck = classify_bottleneck(&stats, &config);
+        assert!(bottleneck.contains("capture/encoder jitter"));
+    }
+
+    #[test]
+    fn bottleneck_classifier_uses_window_receiver_recovery_not_stale_totals() {
+        let config = test_config();
+        let stats = StreamStats {
+            running: true,
+            receiver_packets: 10_000,
+            receiver_dropped_packets: 40,
+            receiver_sequence_gaps: 2,
+            receiver_window_dropped_packets: 0,
+            receiver_window_sequence_gaps: 0,
+            current_fps: 60.0,
+            receiver_input_fps: 60.0,
+            receiver_render_fps: 60.0,
+            receiver_receive_mbps: 20.0,
+            current_mbps: 20.0,
+            ..StreamStats::default()
+        };
+
+        let bottleneck = classify_bottleneck(&stats, &config);
+        assert!(!bottleneck.contains("receiver recovery"));
+
+        let stats = StreamStats {
+            receiver_window_sequence_gaps: 1,
+            ..stats
+        };
+        let bottleneck = classify_bottleneck(&stats, &config);
+        assert!(bottleneck.contains("receiver recovery"));
     }
 
     #[test]
@@ -2387,6 +2815,12 @@ fn apply_receiver_metrics(stats: &mut StreamStats, receiver: &ReceiverMetrics) {
     stats.receiver_max_receive_gap_ms = receiver.stats.max_receive_gap_ms;
     stats.receiver_max_input_gap_ms = receiver.stats.max_input_gap_ms;
     stats.receiver_max_render_gap_ms = receiver.stats.max_render_gap_ms;
+    stats.receiver_latest_receive_to_input_ms = receiver.stats.latest_receive_to_input_ms;
+    stats.receiver_latest_input_to_render_ms = receiver.stats.latest_input_to_render_ms;
+    stats.receiver_latest_receive_to_render_ms = receiver.stats.latest_receive_to_render_ms;
+    stats.receiver_max_receive_to_input_ms = receiver.stats.max_receive_to_input_ms;
+    stats.receiver_max_input_to_render_ms = receiver.stats.max_input_to_render_ms;
+    stats.receiver_max_receive_to_render_ms = receiver.stats.max_receive_to_render_ms;
 }
 
 fn sender_loop(

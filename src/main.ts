@@ -41,6 +41,7 @@ type StreamStats = {
   ffmpeg_reads: number;
   ffmpeg_read_bytes: number;
   parser_buffer_bytes: number;
+  current_max_read_gap_ms: number;
   max_read_gap_ms: number;
   socket_write_blocked_events: number;
   socket_write_blocked_ms: number;
@@ -54,6 +55,7 @@ type StreamStats = {
   resync_dropped_access_units: number;
   bottleneck: string;
   effective_capture_backend: string;
+  video_pipeline: string;
   receiver_running: boolean;
   receiver_decoder_started: boolean;
   receiver_surface_ready: boolean;
@@ -62,7 +64,9 @@ type StreamStats = {
   receiver_queued_inputs: number;
   receiver_rendered_outputs: number;
   receiver_dropped_packets: number;
+  receiver_window_dropped_packets: number;
   receiver_sequence_gaps: number;
+  receiver_window_sequence_gaps: number;
   receiver_config_packets: number;
   receiver_keyframes: number;
   receiver_last_sequence: number;
@@ -78,6 +82,12 @@ type StreamStats = {
   receiver_max_receive_gap_ms: number;
   receiver_max_input_gap_ms: number;
   receiver_max_render_gap_ms: number;
+  receiver_latest_receive_to_input_ms: number;
+  receiver_latest_input_to_render_ms: number;
+  receiver_latest_receive_to_render_ms: number;
+  receiver_max_receive_to_input_ms: number;
+  receiver_max_input_to_render_ms: number;
+  receiver_max_receive_to_render_ms: number;
   elapsed_seconds: number;
   last_error: string;
 };
@@ -468,15 +478,16 @@ function maybeLogHostDiagnostics(stats: StreamStats): void {
   lastHostLogAt = now;
   appendLog(
     `Host diag: access_unit, now=${stats.current_fps.toFixed(1)} VCL/s ${stats.current_mbps.toFixed(1)} Mbps, ` +
-      `bottleneck="${stats.bottleneck}", ` +
+      `bottleneck="${stats.bottleneck}", pipeline=${stats.video_pipeline || 'unknown'}, ` +
       `tablet=rx ${stats.receiver_receive_mbps.toFixed(1)}Mbps input ${stats.receiver_input_fps.toFixed(1)}/s render ${stats.receiver_render_fps.toFixed(1)}/s drop ${stats.receiver_drop_fps.toFixed(1)}/s, ` +
       `avg=${stats.fps.toFixed(1)} VCL/s ${stats.mbps.toFixed(1)} Mbps, ` +
       `keyframes=${stats.keyframe_packets}, maxFrame=${(stats.max_packet_bytes / 1024).toFixed(0)}KiB, ` +
       `maxKey=${(stats.max_keyframe_bytes / 1024).toFixed(0)}KiB, maxDelta=${(stats.max_delta_frame_bytes / 1024).toFixed(0)}KiB, ` +
-      `ffmpegReads=${stats.ffmpeg_reads}, readGapMax=${stats.max_read_gap_ms.toFixed(1)}ms, tabletGaps=${stats.receiver_max_receive_gap_ms.toFixed(1)}/${stats.receiver_max_input_gap_ms.toFixed(1)}/${stats.receiver_max_render_gap_ms.toFixed(1)}ms, ` +
+      `ffmpegReads=${stats.ffmpeg_reads}, readGapNow=${stats.current_max_read_gap_ms.toFixed(1)}ms readGapMax=${stats.max_read_gap_ms.toFixed(1)}ms, tabletGaps=${stats.receiver_max_receive_gap_ms.toFixed(1)}/${stats.receiver_max_input_gap_ms.toFixed(1)}/${stats.receiver_max_render_gap_ms.toFixed(1)}ms, ` +
+      `tabletLatency=latest ${stats.receiver_latest_receive_to_input_ms.toFixed(1)}/${stats.receiver_latest_input_to_render_ms.toFixed(1)}/${stats.receiver_latest_receive_to_render_ms.toFixed(1)}ms max ${stats.receiver_max_receive_to_input_ms.toFixed(1)}/${stats.receiver_max_input_to_render_ms.toFixed(1)}/${stats.receiver_max_receive_to_render_ms.toFixed(1)}ms, ` +
       `socketStalls=${stats.socket_write_blocked_events}/${stats.socket_write_blocked_ms.toFixed(1)}ms max=${stats.max_socket_write_ms.toFixed(1)}ms, ` +
       `paced=${stats.paced_packets}/${stats.paced_sleep_ms.toFixed(1)}ms sendMax=${stats.max_packet_send_ms.toFixed(1)}ms, ` +
-      `queue=${stats.sender_queue_depth}/${stats.receiver_queue_depth} drops=${stats.host_dropped_packets}/${stats.receiver_dropped_packets} seqGaps=${stats.receiver_sequence_gaps} resync=${stats.resync_events}/${stats.resync_dropped_access_units}, ` +
+      `queue=${stats.sender_queue_depth}/${stats.receiver_queue_depth} drops=${stats.host_dropped_packets}/${stats.receiver_window_dropped_packets}/${stats.receiver_dropped_packets} seqGaps=${stats.receiver_window_sequence_gaps}/${stats.receiver_sequence_gaps} resync=${stats.resync_events}/${stats.resync_dropped_access_units}, ` +
       `parserBuffered=${stats.parser_buffer_bytes}B`
   );
 }

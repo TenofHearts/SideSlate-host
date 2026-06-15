@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::io::{Read, Write};
+use std::io::{IoSlice, Read, Write};
 
 pub const MAGIC: [u8; 4] = *b"T2S1";
 pub const VERSION: u8 = 1;
@@ -29,6 +29,7 @@ pub const CAP_KEYFRAME_REQUEST: u32 = 0x0000_0008;
 pub const CODEC_HEVC: u8 = 1;
 
 pub const RECEIVER_STATS_PAYLOAD_SIZE: usize = 152;
+pub const RECEIVER_STATS_EXTENDED_PAYLOAD_SIZE: usize = 200;
 
 #[derive(Debug, Clone)]
 pub struct Message {
@@ -70,12 +71,43 @@ pub fn write_message_parts<W: Write>(
     header[8..12].copy_from_slice(&sequence.to_le_bytes());
     header[12..20].copy_from_slice(&timestamp_us.to_le_bytes());
     header[20..24].copy_from_slice(&(payload.len() as u32).to_le_bytes());
-    writer
-        .write_all(&header)
-        .map_err(|err| format!("socket header write failed: {}", err))?;
-    writer
-        .write_all(payload)
-        .map_err(|err| format!("socket payload write failed: {}", err))?;
+    write_all_vectored(writer, &[&header, payload])
+        .map_err(|err| format!("socket message write failed: {}", err))?;
+    Ok(())
+}
+
+fn write_all_vectored<W: Write>(writer: &mut W, parts: &[&[u8]; 2]) -> std::io::Result<()> {
+    let mut header_offset = 0usize;
+    let mut payload_offset = 0usize;
+
+    while header_offset < parts[0].len() || payload_offset < parts[1].len() {
+        let written = if header_offset < parts[0].len() {
+            writer.write_vectored(&[
+                IoSlice::new(&parts[0][header_offset..]),
+                IoSlice::new(&parts[1][payload_offset..]),
+            ])?
+        } else {
+            writer.write(&parts[1][payload_offset..])?
+        };
+        if written == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "failed to write message",
+            ));
+        }
+
+        let mut remaining = written;
+        if header_offset < parts[0].len() {
+            let header_remaining = parts[0].len() - header_offset;
+            let consumed = remaining.min(header_remaining);
+            header_offset += consumed;
+            remaining -= consumed;
+        }
+        if remaining > 0 {
+            payload_offset += remaining;
+        }
+    }
+
     Ok(())
 }
 
@@ -210,6 +242,12 @@ pub struct ReceiverStats {
     pub max_receive_gap_ms: f64,
     pub max_input_gap_ms: f64,
     pub max_render_gap_ms: f64,
+    pub latest_receive_to_input_ms: f64,
+    pub latest_input_to_render_ms: f64,
+    pub latest_receive_to_render_ms: f64,
+    pub max_receive_to_input_ms: f64,
+    pub max_input_to_render_ms: f64,
+    pub max_receive_to_render_ms: f64,
 }
 
 pub fn parse_receiver_stats_payload(payload: &[u8]) -> Option<ReceiverStats> {
@@ -242,6 +280,12 @@ pub fn parse_receiver_stats_payload(payload: &[u8]) -> Option<ReceiverStats> {
         max_receive_gap_ms: read_f64_le(payload, 128)?,
         max_input_gap_ms: read_f64_le(payload, 136)?,
         max_render_gap_ms: read_f64_le(payload, 144)?,
+        latest_receive_to_input_ms: read_f64_le(payload, 152).unwrap_or(0.0),
+        latest_input_to_render_ms: read_f64_le(payload, 160).unwrap_or(0.0),
+        latest_receive_to_render_ms: read_f64_le(payload, 168).unwrap_or(0.0),
+        max_receive_to_input_ms: read_f64_le(payload, 176).unwrap_or(0.0),
+        max_input_to_render_ms: read_f64_le(payload, 184).unwrap_or(0.0),
+        max_receive_to_render_ms: read_f64_le(payload, 192).unwrap_or(0.0),
     })
 }
 
