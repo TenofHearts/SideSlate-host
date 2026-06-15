@@ -25,11 +25,6 @@
   "bundle": {
     "active": true,
     "targets": ["nsis"],
-    "icon": ["../icon.png", "icons/icon.ico"],
-    "windows": {
-      "nsis": {
-        "installerHooks": "windows/nsis-hooks.nsh"
-      }
-    }
+    "icon": ["../icon.png", "icons/icon.ico"]
   }
 }
