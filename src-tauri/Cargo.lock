@@ -2728,6 +2728,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
+name = "sideslate-host"
+version = "0.6.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "windows 0.58.0",
+]
+
+[[package]]
 name = "simd-adler32"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2908,17 +2919,6 @@ dependencies = [
  "pkg-config",
  "toml 0.8.2",
  "version-compare",
-]
-
-[[package]]
-name = "tablet2screen-host"
-version = "0.6.0"
-dependencies = [
- "serde",
- "serde_json",
- "tauri",
- "tauri-build",
- "windows 0.58.0",
 ]
 
 [[package]]

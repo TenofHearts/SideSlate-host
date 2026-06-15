@@ -1,8 +1,8 @@
 [package]
-name = "tablet2screen-host"
+name = "sideslate-host"
 version = "0.6.0"
-description = "Tablet2Screen Windows host"
-authors = ["Tablet2Screen"]
+description = "SideSlate Windows host"
+authors = ["SideSlate"]
 edition = "2021"
 
 [build-dependencies]

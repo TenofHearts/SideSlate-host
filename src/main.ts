@@ -90,7 +90,7 @@ if (!app) {
 
 app.innerHTML = `
   <aside class="sidebar">
-    <div class="brand">Tablet2Screen</div>
+    <div class="brand">SideSlate</div>
     <nav>
       <a class="active">Dashboard</a>
       <a>USB/HDC</a>
@@ -150,10 +150,9 @@ app.innerHTML = `
           </label>
           <label>FPS<input id="fpsInput" type="number" min="1" max="120" value="60" /></label>
           <label>Bitrate<input id="bitrateInput" value="35M" /></label>
-          <label>VBV buffer<input id="bufsizeInput" value="2M" /></label>
-          <label>GOP<input id="gopInput" type="number" min="1" value="15" /></label>
-          <label>Scale<input id="scaleInput" value="2800:1840" /></label>
-          <label class="checkboxLabel"><input id="sendPacingInput" type="checkbox" checked /> Pace oversized frame sends</label>
+          <label>VBV buffer<input id="bufsizeInput" value="1M" /></label>
+          <label>GOP<input id="gopInput" type="number" min="1" value="6" /></label>
+          <label class="checkboxLabel"><input id="sendPacingInput" type="checkbox" /> Pace oversized frame sends</label>
           <label>Forwarded host:port<input id="targetInput" value="127.0.0.1:17005" /></label>
         </div>
         <div class="buttonRow primaryActions">
@@ -195,7 +194,6 @@ const fpsInput = getInput('fpsInput');
 const bitrateInput = getInput('bitrateInput');
 const bufsizeInput = getInput('bufsizeInput');
 const gopInput = getInput('gopInput');
-const scaleInput = getInput('scaleInput');
 const sendPacingInput = getInput('sendPacingInput');
 const targetInput = getInput('targetInput');
 const statusPill = getElement('statusPill');
@@ -243,7 +241,6 @@ getButton('startButton').addEventListener('click', async () => {
       bitrate: bitrateInput.value,
       bufsize: bufsizeInput.value,
       gop: Number(gopInput.value),
-      scale: scaleInput.value,
       sendPacing: sendPacingInput.checked,
       host: host || '127.0.0.1',
       port: Number(portText || 17005),

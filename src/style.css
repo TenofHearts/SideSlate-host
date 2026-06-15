@@ -61,6 +61,19 @@ select {
   padding: 10px 12px;
 }
 
+input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+  margin: 0;
+  padding: 0;
+}
+
+select {
+  min-width: 0;
+  padding-right: 30px;
+  text-overflow: ellipsis;
+}
+
 label {
   display: grid;
   gap: 6px;
@@ -203,6 +216,14 @@ header p,
 .formGrid label:first-child,
 .formGrid label:last-child {
   grid-column: span 2;
+}
+
+.checkboxLabel {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  align-self: end;
+  min-height: 42px;
 }
 
 .metrics {

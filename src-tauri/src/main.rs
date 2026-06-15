@@ -28,10 +28,10 @@ mod protocol;
 const DEFAULT_HDC: &str =
     r"D:\Program\Huawei\DevEco Studio\sdk\default\openharmony\toolchains\hdc.exe";
 const DEFAULT_FFMPEG: &str = r"D:\Program\ffmpeg-8.1.1\bin\ffmpeg.exe";
-const NATIVE_TARGET_SCALE: &str = "2800:1840";
 const NATIVE_TARGET_BITRATE: &str = "35M";
-const NATIVE_TARGET_BUFSIZE: &str = "2M";
-const NATIVE_TARGET_GOP_60: u32 = 15;
+const NATIVE_TARGET_BUFSIZE: &str = "1M";
+const NATIVE_TARGET_GOP_60: u32 = 6;
+const HOST_SENDER_QUEUE_CAPACITY: usize = 1;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
@@ -64,7 +64,6 @@ struct StreamConfig {
     bitrate: String,
     bufsize: String,
     gop: u32,
-    scale: String,
     send_pacing: bool,
     host: String,
     port: u16,
@@ -645,7 +644,7 @@ fn effective_stream_config(
     display: &DisplayInfo,
     encoder: &str,
 ) -> StreamConfig {
-    config = apply_native_target_profile(config, encoder);
+    config = apply_default_low_latency_profile(config, encoder);
     let max_recovery_gop = recovery_gop_for_resolution(&config, display);
     if config.gop > max_recovery_gop {
         config.gop = max_recovery_gop;
@@ -658,25 +657,21 @@ fn effective_stream_config(
     config
 }
 
-fn apply_native_target_profile(mut config: StreamConfig, encoder: &str) -> StreamConfig {
-    if config.scale.trim() != NATIVE_TARGET_SCALE {
-        return config;
-    }
-
+fn apply_default_low_latency_profile(mut config: StreamConfig, encoder: &str) -> StreamConfig {
     match encoder {
-        "hevc_nvenc" if config.encoder == "auto" || looks_like_native_default_profile(&config) => {
+        "hevc_nvenc" if config.encoder == "auto" || looks_like_default_profile(&config) => {
             config.fps = 60;
             config.bitrate = NATIVE_TARGET_BITRATE.to_string();
             config.bufsize = NATIVE_TARGET_BUFSIZE.to_string();
             config.gop = NATIVE_TARGET_GOP_60;
         }
-        "hevc_qsv" if config.encoder == "auto" || looks_like_native_default_profile(&config) => {
+        "hevc_qsv" if config.encoder == "auto" || looks_like_default_profile(&config) => {
             config.fps = 60;
             config.bitrate = NATIVE_TARGET_BITRATE.to_string();
             config.bufsize = NATIVE_TARGET_BUFSIZE.to_string();
             config.gop = NATIVE_TARGET_GOP_60;
         }
-        "libx265" if config.encoder == "auto" || looks_like_native_default_profile(&config) => {
+        "libx265" if config.encoder == "auto" || looks_like_default_profile(&config) => {
             config.fps = 60;
             config.bitrate = NATIVE_TARGET_BITRATE.to_string();
             config.bufsize = NATIVE_TARGET_BUFSIZE.to_string();
@@ -687,9 +682,8 @@ fn apply_native_target_profile(mut config: StreamConfig, encoder: &str) -> Strea
     config
 }
 
-fn looks_like_native_default_profile(config: &StreamConfig) -> bool {
-    config.scale.trim() == NATIVE_TARGET_SCALE
-        && config.fps == 60
+fn looks_like_default_profile(config: &StreamConfig) -> bool {
+    config.fps == 60
         && config.gop == NATIVE_TARGET_GOP_60
         && matches!(
             config.bitrate.trim().to_ascii_uppercase().as_str(),
@@ -702,16 +696,17 @@ fn recovery_gop_for_resolution(config: &StreamConfig, display: &DisplayInfo) -> 
     let pixels = width.saturating_mul(height);
     let fps = config.fps.max(1);
     if pixels <= 2800 * 1840 {
-        fps.saturating_add(3) / 4
+        // Low-latency streaming, like Sunshine/Moonlight, keeps recovery tight enough that
+        // dropped inter frames do not stay visible for multiple interaction frames.
+        fps.saturating_add(9) / 10
     } else {
-        fps.saturating_add(2) / 3
+        fps.saturating_add(4) / 5
     }
     .max(1)
 }
 
-fn requested_output_dimensions(config: &StreamConfig, display: &DisplayInfo) -> (u32, u32) {
-    parse_scale(&config.scale)
-        .unwrap_or_else(|| (display.width.max(1) as u32, display.height.max(1) as u32))
+fn requested_output_dimensions(_config: &StreamConfig, display: &DisplayInfo) -> (u32, u32) {
+    (display.width.max(1) as u32, display.height.max(1) as u32)
 }
 
 fn quote_command(command: &[String]) -> String {
@@ -741,14 +736,6 @@ fn use_gpu_resident_dxgi(config: &StreamConfig, encoder: &str) -> bool {
         "ddagrab" => matches!(encoder, "hevc_nvenc" | "hevc_qsv"),
         _ => false,
     }
-}
-
-fn parse_scale(scale: &str) -> Option<(u32, u32)> {
-    let scale = scale.trim();
-    let (width, height) = scale.split_once(':')?;
-    let width = width.parse::<u32>().ok()?;
-    let height = height.parse::<u32>().ok()?;
-    (width > 0 && height > 0).then_some((width, height))
 }
 
 fn ddagrab_device(display: &DisplayInfo) -> Result<(u32, u32), String> {
@@ -867,27 +854,11 @@ fn build_ffmpeg_command(
     let gpu_resident_dxgi = use_gpu_resident_dxgi(&effective_config, encoder);
     if gpu_resident_dxgi && encoder == "hevc_qsv" {
         filters.push("hwmap=derive_device=qsv".to_string());
-        if let Some((width, height)) = parse_scale(&config.scale) {
-            filters.push(format!("scale_qsv=w={}:h={}:format=nv12", width, height));
-        } else {
-            filters.push("scale_qsv=format=nv12".to_string());
-        }
-    } else if gpu_resident_dxgi {
-        if let Some((width, height)) = parse_scale(&config.scale) {
-            filters.push(format!(
-                "scale_d3d11=width={}:height={}:format=bgra",
-                width, height
-            ));
-        }
+        filters.push("scale_qsv=format=nv12".to_string());
     } else if capture_backend != "gdigrab" {
         filters.push("hwdownload".to_string());
         filters.push("format=bgra".to_string());
-        if !config.scale.trim().is_empty() {
-            filters.push(format!("scale={}", config.scale.trim()));
-        }
         filters.push("format=yuv420p".to_string());
-    } else if !config.scale.trim().is_empty() {
-        filters.push(format!("scale={}", config.scale.trim()));
     }
     if !filters.is_empty() {
         command.extend(["-vf".into(), filters.join(",")]);
@@ -1073,7 +1044,7 @@ fn run_stream_loop(
         encoder,
         "",
     );
-    protocol_handshake(&mut stream, config, command)?;
+    protocol_handshake(&mut stream, config, display, command)?;
     stream
         .set_read_timeout(None)
         .map_err(|err| format!("clear TCP read timeout failed: {}", err))?;
@@ -1164,7 +1135,7 @@ fn run_stream_loop(
     let mut last_read: Option<Instant> = None;
     let bitrate_kbps = parse_size_to_kbits(&config.bitrate);
     let send_pacer = SendPacer::new(config.send_pacing, bitrate_kbps, config.fps);
-    let sender_queue = Arc::new(SenderQueue::new(2));
+    let sender_queue = Arc::new(SenderQueue::new(HOST_SENDER_QUEUE_CAPACITY));
     let sender_metrics = Arc::new(Mutex::new(SenderMetrics::default()));
     let sender_handle = {
         let queue = sender_queue.clone();
@@ -1186,7 +1157,7 @@ fn run_stream_loop(
     write_stream_log(
         &mut log_file,
         &format!(
-            "START encoder={} bitrate={} bufsize={} gop={} fps={} capture={} display={} device=\"{}\" virtual={} dxgi_adapter={:?} dxgi_output={:?} dxgi_adapter_name=\"{}\" scale={} pacing={} command={}",
+            "START encoder={} bitrate={} bufsize={} gop={} fps={} capture={} display={} device=\"{}\" virtual={} dxgi_adapter={:?} dxgi_output={:?} dxgi_adapter_name=\"{}\" output={}x{} pacing={} command={}",
             encoder,
             config.bitrate,
             config.bufsize,
@@ -1199,7 +1170,8 @@ fn run_stream_loop(
             display.dxgi_adapter_idx,
             display.dxgi_output_idx,
             display.dxgi_adapter_name,
-            config.scale,
+            display.width,
+            display.height,
             config.send_pacing,
             quote_command(command)
         ),
@@ -1475,7 +1447,7 @@ fn update_status(
 fn open_stream_log() -> Option<std::fs::File> {
     let path = std::env::current_dir()
         .unwrap_or_else(|_| std::path::PathBuf::from("."))
-        .join("tablet2screen-stream.log");
+        .join("sideslate-stream.log");
     OpenOptions::new().create(true).append(true).open(path).ok()
 }
 
@@ -1593,6 +1565,7 @@ fn timestamp_seconds() -> f64 {
 fn protocol_handshake(
     stream: &mut TcpStream,
     config: &StreamConfig,
+    display: &DisplayInfo,
     command: &[String],
 ) -> Result<(), String> {
     protocol::write_message(
@@ -1607,7 +1580,7 @@ fn protocol_handshake(
     )?;
     protocol::expect_type(protocol::read_message(stream)?, protocol::TYPE_HELLO_ACK)?;
 
-    let (width, height) = output_dimensions(config, command);
+    let (width, height) = output_dimensions(display, command);
     protocol::write_message(
         stream,
         &protocol::Message {
@@ -1631,16 +1604,7 @@ fn protocol_handshake(
     Ok(())
 }
 
-fn output_dimensions(config: &StreamConfig, command: &[String]) -> (u32, u32) {
-    let scale = config.scale.trim();
-    if let Some((width, height)) = scale.split_once(':') {
-        if let (Ok(width), Ok(height)) = (width.parse::<u32>(), height.parse::<u32>()) {
-            if width > 0 && height > 0 {
-                return (width, height);
-            }
-        }
-    }
-
+fn output_dimensions(display: &DisplayInfo, command: &[String]) -> (u32, u32) {
     for window in command.windows(2) {
         if window[0] == "-video_size" {
             if let Some((width, height)) = window[1].split_once('x') {
@@ -1671,7 +1635,7 @@ fn output_dimensions(config: &StreamConfig, command: &[String]) -> (u32, u32) {
             }
         }
     }
-    (1920, 1080)
+    (display.width.max(1) as u32, display.height.max(1) as u32)
 }
 
 fn send_packet(
@@ -1750,7 +1714,6 @@ mod tests {
             bitrate: NATIVE_TARGET_BITRATE.to_string(),
             bufsize: NATIVE_TARGET_BUFSIZE.to_string(),
             gop: NATIVE_TARGET_GOP_60,
-            scale: NATIVE_TARGET_SCALE.to_string(),
             send_pacing: true,
             host: "127.0.0.1".to_string(),
             port: 5000,
@@ -1792,13 +1755,12 @@ mod tests {
     }
 
     #[test]
-    fn output_dimensions_parse_full_ddagrab_video_size() {
-        let mut config = test_config();
-        config.scale.clear();
-        let command = build_ffmpeg_command(&config, &virtual_display(), "hevc_nvenc")
+    fn output_dimensions_parse_selected_display_video_size() {
+        let display = virtual_display();
+        let command = build_ffmpeg_command(&test_config(), &display, "hevc_nvenc")
             .expect("command should build");
 
-        assert_eq!(output_dimensions(&config, &command), (3840, 2160));
+        assert_eq!(output_dimensions(&display, &command), (3840, 2160));
     }
 
     #[test]
@@ -1832,7 +1794,9 @@ mod tests {
             window[0] == "-init_hw_device" && window[1] == "qsv=t2s_qsv@t2s_dda"
         }));
         assert!(filter.contains("hwmap=derive_device=qsv"));
-        assert!(filter.contains("scale_qsv=w=2800:h=1840:format=nv12"));
+        assert!(filter.contains("scale_qsv=format=nv12"));
+        assert!(!filter.contains("w="));
+        assert!(!filter.contains("h="));
     }
 
     #[test]
@@ -1882,35 +1846,35 @@ mod tests {
     }
 
     #[test]
-    fn effective_config_bounds_1080p_recovery_to_quarter_second() {
+    fn effective_config_bounds_1080p_recovery_to_sub_100ms_at_60fps() {
         let mut config = test_config();
         config.gop = 60;
-        config.scale = "1920:1080".to_string();
+        let mut display = virtual_display();
+        display.width = 1920;
+        display.height = 1080;
 
-        let config = effective_stream_config(config, &virtual_display(), "hevc_qsv");
+        let config = effective_stream_config(config, &display, "hevc_qsv");
 
-        assert_eq!(config.gop, 15);
+        assert_eq!(config.gop, 6);
     }
 
     #[test]
     fn effective_config_uses_longer_recovery_for_above_tablet_native_resolution() {
         let mut config = test_config();
         config.gop = 60;
-        config.scale.clear();
 
         let config = effective_stream_config(config, &virtual_display(), "hevc_nvenc");
 
-        assert_eq!(config.gop, 20);
+        assert_eq!(config.gop, 12);
     }
 
     #[test]
-    fn native_target_profile_promotes_nvenc_machines_to_native_60() {
+    fn default_profile_keeps_nvenc_machines_at_low_latency_60() {
         let mut config = test_config();
         config.encoder = "auto".to_string();
 
         let config = effective_stream_config(config, &virtual_display(), "hevc_nvenc");
 
-        assert_eq!(config.scale, NATIVE_TARGET_SCALE);
         assert_eq!(config.fps, 60);
         assert_eq!(config.bitrate, NATIVE_TARGET_BITRATE);
         assert_eq!(config.bufsize, NATIVE_TARGET_BUFSIZE);
@@ -1918,13 +1882,12 @@ mod tests {
     }
 
     #[test]
-    fn native_target_profile_keeps_qsv_machines_at_universal_target() {
+    fn default_profile_keeps_qsv_machines_at_low_latency_60() {
         let mut config = test_config();
         config.encoder = "auto".to_string();
 
         let config = effective_stream_config(config, &virtual_display(), "hevc_qsv");
 
-        assert_eq!(config.scale, NATIVE_TARGET_SCALE);
         assert_eq!(config.fps, 60);
         assert_eq!(config.bitrate, NATIVE_TARGET_BITRATE);
         assert_eq!(config.bufsize, NATIVE_TARGET_BUFSIZE);
@@ -2640,5 +2603,5 @@ fn main() {
             get_stream_stats
         ])
         .run(tauri::generate_context!())
-        .expect("error while running Tablet2Screen host");
+        .expect("error while running SideSlate host");
 }
