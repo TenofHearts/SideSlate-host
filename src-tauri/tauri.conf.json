@@ -24,7 +24,12 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["msi"],
-    "icon": ["../icon.png", "icons/icon.ico"]
+    "targets": ["nsis"],
+    "icon": ["../icon.png", "icons/icon.ico"],
+    "windows": {
+      "nsis": {
+        "installerHooks": "windows/nsis-hooks.nsh"
+      }
+    }
   }
 }
