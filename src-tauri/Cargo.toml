@@ -1,6 +1,6 @@
 [package]
 name = "sideslate-host"
-version = "0.6.0"
+version = "1.0.0"
 description = "SideSlate Windows host"
 authors = ["SideSlate"]
 edition = "2021"

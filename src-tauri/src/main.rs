@@ -2,12 +2,13 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::mem::size_of;
 use std::net::TcpStream;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -42,8 +43,9 @@ const MENU_STOP: &str = "stop";
 const MENU_REFRESH_DISPLAYS: &str = "refresh_displays";
 const MENU_EXIT: &str = "exit";
 const MENU_DISPLAY_PREFIX: &str = "display:";
+const SETTINGS_FILE: &str = "host-settings.json";
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct DisplayInfo {
     id: usize,
     name: String,
@@ -60,7 +62,7 @@ struct DisplayInfo {
     dxgi_adapter_name: String,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct StreamConfig {
     hdc_path: String,
@@ -226,12 +228,160 @@ struct Defaults {
     ffmpeg_path: String,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PersistedHostSettings {
+    config: StreamConfig,
+    display_fingerprint: Option<String>,
+}
+
 #[tauri::command]
 fn get_defaults() -> Defaults {
     Defaults {
         hdc_path: DEFAULT_HDC.to_string(),
         ffmpeg_path: DEFAULT_FFMPEG.to_string(),
     }
+}
+
+fn host_settings_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_config_dir()
+        .map_err(|error| error.to_string())?;
+    Ok(dir.join(SETTINGS_FILE))
+}
+
+fn load_host_settings(app: &AppHandle) -> Result<Option<PersistedHostSettings>, String> {
+    let path = host_settings_path(app)?;
+    let content = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "failed to read settings from {}: {}",
+                path.display(),
+                error
+            ))
+        }
+    };
+    serde_json::from_str(&content).map(Some).map_err(|error| {
+        format!(
+            "failed to parse settings from {}: {}",
+            path.display(),
+            error
+        )
+    })
+}
+
+fn save_host_settings_to_disk(
+    app: &AppHandle,
+    settings: &PersistedHostSettings,
+) -> Result<(), String> {
+    let path = host_settings_path(app)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "failed to create settings directory {}: {}",
+                parent.display(),
+                error
+            )
+        })?;
+    }
+    let content = serde_json::to_string_pretty(settings)
+        .map_err(|error| format!("failed to serialize settings: {}", error))?;
+    fs::write(&path, content)
+        .map_err(|error| format!("failed to write settings to {}: {}", path.display(), error))
+}
+
+fn persist_stream_config(
+    app: &AppHandle,
+    state: &AppState,
+    config: StreamConfig,
+    display: &DisplayInfo,
+) -> Result<(), String> {
+    let settings = PersistedHostSettings {
+        config: config.clone(),
+        display_fingerprint: Some(display_fingerprint(display)),
+    };
+    save_host_settings_to_disk(app, &settings)?;
+    let mut guard = state
+        .0
+        .lock()
+        .map_err(|_| "state lock poisoned".to_string())?;
+    guard.selected_display_id = Some(config.display_id);
+    guard.last_config = Some(config);
+    Ok(())
+}
+
+fn display_fingerprint(display: &DisplayInfo) -> String {
+    format!(
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        display.name,
+        display.device_string,
+        display.left,
+        display.top,
+        display.width,
+        display.height,
+        display.primary,
+        display
+            .dxgi_adapter_idx
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+        display
+            .dxgi_output_idx
+            .map(|value| value.to_string())
+            .unwrap_or_default()
+    )
+}
+
+fn match_persisted_display<'a>(
+    settings: &PersistedHostSettings,
+    displays: &'a [DisplayInfo],
+) -> Option<&'a DisplayInfo> {
+    settings
+        .display_fingerprint
+        .as_ref()
+        .and_then(|fingerprint| {
+            displays
+                .iter()
+                .find(|display| display_fingerprint(display) == *fingerprint)
+        })
+}
+
+#[tauri::command]
+fn get_host_settings(
+    app: AppHandle,
+    state: State<AppState>,
+) -> Result<PersistedHostSettings, String> {
+    let settings = load_host_settings(&app)?.unwrap_or_else(|| {
+        let selected_display_id = state
+            .0
+            .lock()
+            .ok()
+            .and_then(|guard| guard.selected_display_id)
+            .unwrap_or(0);
+        PersistedHostSettings {
+            config: default_stream_config(selected_display_id),
+            display_fingerprint: None,
+        }
+    });
+    Ok(settings)
+}
+
+#[tauri::command]
+fn save_host_settings(
+    app: AppHandle,
+    state: State<AppState>,
+    settings: PersistedHostSettings,
+) -> Result<(), String> {
+    save_host_settings_to_disk(&app, &settings)?;
+    let mut guard = state
+        .0
+        .lock()
+        .map_err(|_| "state lock poisoned".to_string())?;
+    guard.selected_display_id = Some(settings.config.display_id);
+    guard.last_config = Some(settings.config);
+    Ok(())
 }
 
 #[tauri::command]
@@ -293,10 +443,12 @@ fn start_stream_with_state(
 
     let displays = enumerate_displays()?;
     let display = displays
-        .into_iter()
+        .iter()
         .find(|display| display.id == config.display_id)
+        .cloned()
         .ok_or_else(|| format!("display {} not found", config.display_id))?;
 
+    persist_stream_config(&app, state, config.clone(), &display)?;
     let encoder = choose_encoder(&config.ffmpeg_path, &config.encoder)?;
     let config = effective_stream_config(config, &display, &encoder);
     let command = build_ffmpeg_command(&config, &display, &encoder)?;
@@ -2775,17 +2927,61 @@ fn start_stream_from_tray(app: &AppHandle) -> Result<(), String> {
     start_stream_with_state(app.clone(), &state, config)
 }
 
+fn initialize_persisted_host(app: &AppHandle) -> Result<Option<StreamConfig>, String> {
+    let Some(settings) = load_host_settings(app)? else {
+        return Ok(None);
+    };
+
+    let displays = enumerate_displays()?;
+    let matched_display = match_persisted_display(&settings, &displays).cloned();
+    let mut config = settings.config;
+    if let Some(display) = &matched_display {
+        config.display_id = display.id;
+    }
+
+    let state = app.state::<AppState>();
+    {
+        let mut guard = state
+            .0
+            .lock()
+            .map_err(|_| "state lock poisoned".to_string())?;
+        guard.selected_display_id = matched_display.as_ref().map(|display| display.id);
+        guard.last_config = Some(config.clone());
+    }
+
+    if let Some(display) = matched_display {
+        let normalized_settings = PersistedHostSettings {
+            config: config.clone(),
+            display_fingerprint: Some(display_fingerprint(&display)),
+        };
+        save_host_settings_to_disk(app, &normalized_settings)?;
+        Ok(Some(config))
+    } else {
+        Ok(None)
+    }
+}
+
+fn record_startup_error(state: &AppState, error: String) {
+    if let Ok(mut guard) = state.0.lock() {
+        guard.stats.running = false;
+        guard.stats.status = "error".to_string();
+        guard.stats.last_error = error;
+    }
+}
+
 fn set_selected_display(
     app: &AppHandle,
     state: &AppState,
     display_id: usize,
 ) -> Result<(), String> {
     let displays = enumerate_displays()?;
-    if !displays.iter().any(|display| display.id == display_id) {
-        return Err(format!("display {} not found", display_id));
-    }
+    let display = displays
+        .iter()
+        .find(|display| display.id == display_id)
+        .cloned()
+        .ok_or_else(|| format!("display {} not found", display_id))?;
 
-    {
+    let config_to_persist = {
         let mut guard = state
             .0
             .lock()
@@ -2793,8 +2989,12 @@ fn set_selected_display(
         guard.selected_display_id = Some(display_id);
         if let Some(config) = guard.last_config.as_mut() {
             config.display_id = display_id;
+            config.clone()
+        } else {
+            default_stream_config(display_id)
         }
-    }
+    };
+    persist_stream_config(app, state, config_to_persist, &display)?;
 
     app.emit("display-selected", display_id)
         .map_err(|error| error.to_string())?;
@@ -2851,6 +3051,18 @@ fn main() {
         }))))
         .setup(|app| {
             setup_tray(app)?;
+            let app_handle = app.handle().clone();
+            let state = app_handle.state::<AppState>();
+            match initialize_persisted_host(&app_handle) {
+                Ok(Some(config)) => {
+                    if let Err(error) = start_stream_with_state(app_handle.clone(), &state, config)
+                    {
+                        record_startup_error(&state, error);
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => record_startup_error(&state, error),
+            }
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -2870,6 +3082,8 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             get_defaults,
+            get_host_settings,
+            save_host_settings,
             list_displays,
             list_hdc_targets,
             setup_hdc_forward,
