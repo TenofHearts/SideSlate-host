@@ -26,6 +26,7 @@ use windows::Win32::Graphics::Gdi::{
     MONITORINFOEXW,
 };
 
+mod native_video;
 mod protocol;
 
 const DEFAULT_HDC: &str =
@@ -446,6 +447,25 @@ fn get_stream_stats(state: State<AppState>) -> Result<StreamStats, String> {
         .lock()
         .map_err(|_| "state lock poisoned".to_string())?;
     Ok(guard.stats.clone())
+}
+
+#[tauri::command]
+fn probe_native_video(display_id: usize) -> Result<native_video::NativeVideoProbe, String> {
+    let displays = enumerate_displays()?;
+    let display = displays
+        .iter()
+        .find(|display| display.id == display_id)
+        .ok_or_else(|| format!("display {} not found", display_id))?;
+    let adapter_idx = display
+        .dxgi_adapter_idx
+        .ok_or_else(|| "selected display has no DXGI adapter mapping".to_string())?;
+    let output_idx = display
+        .dxgi_output_idx
+        .ok_or_else(|| "selected display has no DXGI output mapping".to_string())?;
+    native_video::probe_native_video(native_video::NativeDisplayTarget {
+        adapter_idx,
+        output_idx,
+    })
 }
 
 #[tauri::command]
@@ -961,7 +981,7 @@ fn ddagrab_device(display: &DisplayInfo) -> Result<(u32, u32), String> {
 fn ddagrab_input(config: &StreamConfig, display: &DisplayInfo) -> Result<String, String> {
     let (_, output_idx) = ddagrab_device(display)?;
     Ok(format!(
-        "ddagrab=output_idx={}:framerate={}:draw_mouse=1:dup_frames=1:video_size={}x{}:output_fmt=bgra:allow_fallback=1",
+        "ddagrab=output_idx={}:framerate={}:draw_mouse=1:dup_frames=0:video_size={}x{}:output_fmt=bgra:allow_fallback=1",
         output_idx, config.fps, display.width, display.height
     ))
 }
@@ -1036,12 +1056,12 @@ fn build_ffmpeg_command(
                 ddagrab_input(config, display)?,
             ]);
         }
-        _ => command.extend([
-            "-f".into(),
-            "lavfi".into(),
-            "-i".into(),
-            ddagrab_input(config, display)?,
-        ]),
+        other => {
+            return Err(format!(
+                "unsupported capture backend '{}'; expected gdigrab, gfxcapture, ddagrab, ddagrab_zero_copy, or ddagrab_compat",
+                other
+            ));
+        }
     }
 
     let mut filters = Vec::new();
@@ -1293,60 +1313,8 @@ fn run_stream_loop(
 
     let receiver_metrics = Arc::new(Mutex::new(ReceiverMetrics::default()));
 
-    update_status(state, app, true, "starting ffmpeg", encoder, "");
-    let mut child = hidden_command(&command[0])
-        .args(&command[1..])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|err| format!("ffmpeg start failed: {}", err))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "ffmpeg stdout unavailable".to_string())?;
-    let (stdout_tx, stdout_rx) = mpsc::sync_channel::<Result<Vec<u8>, String>>(1);
-    let stdout_reader_handle = thread::spawn(move || {
-        let mut stdout = stdout;
-        let mut read_buffer = [0u8; 64 * 1024];
-        loop {
-            match stdout.read(&mut read_buffer) {
-                Ok(0) => break,
-                Ok(read) => {
-                    if stdout_tx.send(Ok(read_buffer[..read].to_vec())).is_err() {
-                        break;
-                    }
-                }
-                Err(err) => {
-                    let _ = stdout_tx.send(Err(format!("ffmpeg read failed: {}", err)));
-                    break;
-                }
-            }
-        }
-    });
-    let stderr_tail = Arc::new(Mutex::new(String::new()));
-    let stderr_handle = child.stderr.take().map(|stderr| {
-        let stderr_tail = stderr_tail.clone();
-        thread::spawn(move || {
-            let reader = BufReader::new(stderr);
-            for line in reader.lines().map_while(Result::ok) {
-                if let Ok(mut tail) = stderr_tail.lock() {
-                    tail.push_str(&line);
-                    tail.push('\n');
-                    if tail.len() > 8192 {
-                        while tail.len() > 8192 {
-                            tail.remove(0);
-                        }
-                    }
-                }
-            }
-        })
-    });
-    {
-        let mut guard = child_slot
-            .lock()
-            .map_err(|_| "child lock poisoned".to_string())?;
-        *guard = Some(child);
-    }
+    let mut encoded_source =
+        FfmpegEncodedVideoSource::start(state, app, encoder, command, child_slot)?;
 
     update_status(state, app, true, "streaming", encoder, "");
     let start = Instant::now();
@@ -1427,8 +1395,8 @@ fn run_stream_loop(
 
     let mut ffmpeg_stdout_eof = false;
     while !stop.load(Ordering::SeqCst) {
-        let packets_to_send = match stdout_rx.recv_timeout(idle_flush_interval) {
-            Ok(Ok(chunk)) => {
+        let packets_to_send = match encoded_source.recv_timeout(idle_flush_interval) {
+            Ok(EncodedSourceEvent::Bytes(chunk)) => {
                 let now = Instant::now();
                 if let Some(previous_read) = last_read {
                     let read_gap_ms = now.duration_since(previous_read).as_secs_f64() * 1000.0;
@@ -1440,9 +1408,8 @@ fn run_stream_loop(
                 ffmpeg_read_bytes += chunk.len() as u64;
                 access_unit_parser.push(&chunk)
             }
-            Ok(Err(error)) => return Err(error),
-            Err(mpsc::RecvTimeoutError::Timeout) => access_unit_parser.flush_idle(),
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Ok(EncodedSourceEvent::Timeout) => access_unit_parser.flush_idle(),
+            Ok(EncodedSourceEvent::Ended) => {
                 ffmpeg_stdout_eof = true;
                 let packets = access_unit_parser.flush_idle();
                 if packets.is_empty() {
@@ -1450,6 +1417,7 @@ fn run_stream_loop(
                 }
                 packets
             }
+            Err(error) => return Err(error),
         };
 
         for packet in packets_to_send {
@@ -1579,64 +1547,32 @@ fn run_stream_loop(
     let user_requested_stop = stop.load(Ordering::SeqCst);
     stop.store(true, Ordering::SeqCst);
 
-    let mut ffmpeg_status_error = None;
-    let mut ffmpeg_exit_status = None;
-    if let Ok(mut guard) = child_slot.lock() {
-        if let Some(mut child) = guard.take() {
-            if ffmpeg_stdout_eof {
-                match child.wait() {
-                    Ok(status) if status.success() => {
-                        ffmpeg_exit_status = Some(status.to_string());
-                    }
-                    Ok(status) => {
-                        let status_text = status.to_string();
-                        ffmpeg_exit_status = Some(status_text.clone());
-                        ffmpeg_status_error = Some(format!("ffmpeg exited with {}", status_text));
-                    }
-                    Err(err) => {
-                        ffmpeg_status_error = Some(format!("ffmpeg wait failed: {}", err));
-                    }
+    let source_finish =
+        match encoded_source.finish(child_slot, user_requested_stop, ffmpeg_stdout_eof) {
+            Ok(report) => report,
+            Err(SourceFinishError { error, stderr_tail }) => {
+                write_stream_log(
+                    &mut log_file,
+                    &format!(
+                        "END error=\"{}\" ffmpeg_reads={} ffmpeg_bytes={} stderr=\"{}\"",
+                        error,
+                        ffmpeg_reads,
+                        ffmpeg_read_bytes,
+                        stderr_tail.replace('\n', "\\n")
+                    ),
+                );
+                if stderr_tail.is_empty() {
+                    return Err(error);
                 }
-            } else if user_requested_stop {
-                let _ = child.kill();
-                let _ = child.wait();
-            } else {
-                let _ = child.kill();
-                let _ = child.wait();
-                ffmpeg_status_error = Some("ffmpeg stdout ended unexpectedly".to_string());
+                return Err(format!("{}. Recent ffmpeg stderr:\n{}", error, stderr_tail));
             }
-        }
-    }
-    if let Some(handle) = stderr_handle {
-        let _ = handle.join();
-    }
-    let _ = stdout_reader_handle.join();
-    if let Some(error) = ffmpeg_status_error {
-        let tail = stderr_tail
-            .lock()
-            .map(|tail| tail.trim().to_string())
-            .unwrap_or_default();
-        write_stream_log(
-            &mut log_file,
-            &format!(
-                "END error=\"{}\" ffmpeg_reads={} ffmpeg_bytes={} stderr=\"{}\"",
-                error,
-                ffmpeg_reads,
-                ffmpeg_read_bytes,
-                tail.replace('\n', "\\n")
-            ),
-        );
-        if tail.is_empty() {
-            return Err(error);
-        }
-        return Err(format!("{}. Recent ffmpeg stderr:\n{}", error, tail));
-    }
+        };
     if ffmpeg_stdout_eof && !user_requested_stop {
-        let status = ffmpeg_exit_status.unwrap_or_else(|| "unknown status".to_string());
-        let tail = stderr_tail
-            .lock()
-            .map(|tail| tail.trim().to_string())
-            .unwrap_or_default();
+        let status = source_finish
+            .exit_status
+            .clone()
+            .unwrap_or_else(|| "unknown status".to_string());
+        let tail = source_finish.stderr_tail.clone();
         let error = if ffmpeg_reads == 0 {
             format!("ffmpeg exited before producing stdout bytes ({})", status)
         } else {
@@ -1667,12 +1603,181 @@ fn run_stream_loop(
             user_requested_stop || ffmpeg_stdout_eof,
             user_requested_stop,
             ffmpeg_stdout_eof,
-            ffmpeg_exit_status.unwrap_or_else(|| "not_waited".to_string()),
+            source_finish
+                .exit_status
+                .clone()
+                .unwrap_or_else(|| "not_waited".to_string()),
             ffmpeg_reads,
             ffmpeg_read_bytes
         ),
     );
     Ok(())
+}
+
+enum EncodedSourceEvent {
+    Bytes(Vec<u8>),
+    Timeout,
+    Ended,
+}
+
+struct SourceFinishReport {
+    exit_status: Option<String>,
+    stderr_tail: String,
+}
+
+struct SourceFinishError {
+    error: String,
+    stderr_tail: String,
+}
+
+struct FfmpegEncodedVideoSource {
+    stdout_rx: mpsc::Receiver<Result<Vec<u8>, String>>,
+    stdout_reader_handle: Option<JoinHandle<()>>,
+    stderr_tail: Arc<Mutex<String>>,
+    stderr_handle: Option<JoinHandle<()>>,
+}
+
+impl FfmpegEncodedVideoSource {
+    fn start(
+        state: &Arc<Mutex<AppStateInner>>,
+        app: &AppHandle,
+        encoder: &str,
+        command: &[String],
+        child_slot: &Arc<Mutex<Option<Child>>>,
+    ) -> Result<Self, String> {
+        update_status(state, app, true, "starting ffmpeg", encoder, "");
+        let mut child = hidden_command(&command[0])
+            .args(&command[1..])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|err| format!("ffmpeg start failed: {}", err))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "ffmpeg stdout unavailable".to_string())?;
+        let (stdout_tx, stdout_rx) = mpsc::sync_channel::<Result<Vec<u8>, String>>(1);
+        let stdout_reader_handle = thread::spawn(move || {
+            let mut stdout = stdout;
+            let mut read_buffer = [0u8; 64 * 1024];
+            loop {
+                match stdout.read(&mut read_buffer) {
+                    Ok(0) => break,
+                    Ok(read) => {
+                        if stdout_tx.send(Ok(read_buffer[..read].to_vec())).is_err() {
+                            break;
+                        }
+                    }
+                    Err(err) => {
+                        let _ = stdout_tx.send(Err(format!("ffmpeg read failed: {}", err)));
+                        break;
+                    }
+                }
+            }
+        });
+        let stderr_tail = Arc::new(Mutex::new(String::new()));
+        let stderr_handle = child.stderr.take().map(|stderr| {
+            let stderr_tail = stderr_tail.clone();
+            thread::spawn(move || {
+                let reader = BufReader::new(stderr);
+                for line in reader.lines().map_while(Result::ok) {
+                    if let Ok(mut tail) = stderr_tail.lock() {
+                        tail.push_str(&line);
+                        tail.push('\n');
+                        if tail.len() > 8192 {
+                            while tail.len() > 8192 {
+                                tail.remove(0);
+                            }
+                        }
+                    }
+                }
+            })
+        });
+        {
+            let mut guard = child_slot
+                .lock()
+                .map_err(|_| "child lock poisoned".to_string())?;
+            *guard = Some(child);
+        }
+
+        Ok(Self {
+            stdout_rx,
+            stdout_reader_handle: Some(stdout_reader_handle),
+            stderr_tail,
+            stderr_handle,
+        })
+    }
+
+    fn recv_timeout(&mut self, timeout: Duration) -> Result<EncodedSourceEvent, String> {
+        match self.stdout_rx.recv_timeout(timeout) {
+            Ok(Ok(chunk)) => Ok(EncodedSourceEvent::Bytes(chunk)),
+            Ok(Err(error)) => Err(error),
+            Err(mpsc::RecvTimeoutError::Timeout) => Ok(EncodedSourceEvent::Timeout),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Ok(EncodedSourceEvent::Ended),
+        }
+    }
+
+    fn finish(
+        mut self,
+        child_slot: &Arc<Mutex<Option<Child>>>,
+        user_requested_stop: bool,
+        stdout_eof: bool,
+    ) -> Result<SourceFinishReport, SourceFinishError> {
+        let mut status_error = None;
+        let mut exit_status = None;
+        if let Ok(mut guard) = child_slot.lock() {
+            if let Some(mut child) = guard.take() {
+                if stdout_eof {
+                    match child.wait() {
+                        Ok(status) if status.success() => {
+                            exit_status = Some(status.to_string());
+                        }
+                        Ok(status) => {
+                            let status_text = status.to_string();
+                            exit_status = Some(status_text.clone());
+                            status_error = Some(format!("ffmpeg exited with {}", status_text));
+                        }
+                        Err(err) => {
+                            status_error = Some(format!("ffmpeg wait failed: {}", err));
+                        }
+                    }
+                } else if user_requested_stop {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                } else {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    status_error = Some("ffmpeg stdout ended unexpectedly".to_string());
+                }
+            }
+        } else {
+            status_error = Some("child lock poisoned".to_string());
+        }
+
+        if let Some(handle) = self.stderr_handle.take() {
+            let _ = handle.join();
+        }
+        if let Some(handle) = self.stdout_reader_handle.take() {
+            let _ = handle.join();
+        }
+
+        let stderr_tail = self.stderr_tail();
+        if let Some(error) = status_error {
+            return Err(SourceFinishError { error, stderr_tail });
+        }
+
+        Ok(SourceFinishReport {
+            exit_status,
+            stderr_tail,
+        })
+    }
+
+    fn stderr_tail(&self) -> String {
+        self.stderr_tail
+            .lock()
+            .map(|tail| tail.trim().to_string())
+            .unwrap_or_default()
+    }
 }
 
 fn hidden_command(program: &str) -> Command {
@@ -2072,9 +2177,23 @@ mod tests {
         assert!(command
             .windows(2)
             .any(|window| window[0] == "-i" && window[1].contains("ddagrab=output_idx=0:")));
+        assert!(command
+            .windows(2)
+            .any(|window| window[0] == "-i" && window[1].contains("dup_frames=0")));
         assert!(!command
             .windows(2)
             .any(|window| window[0] == "-i" && window[1].contains("ddagrab=output_idx=1:")));
+    }
+
+    #[test]
+    fn unsupported_capture_backend_fails_instead_of_falling_back() {
+        let mut config = test_config();
+        config.capture_backend = "native_mf".to_string();
+
+        let error = build_ffmpeg_command(&config, &virtual_display(), "hevc_nvenc")
+            .expect_err("unsupported backend should not silently run FFmpeg ddagrab");
+
+        assert!(error.contains("unsupported capture backend 'native_mf'"));
     }
 
     #[test]
@@ -3540,6 +3659,7 @@ fn main() {
             list_displays,
             list_hdc_targets,
             setup_hdc_forward,
+            probe_native_video,
             select_display,
             start_stream,
             stop_stream,
