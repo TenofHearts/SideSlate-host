@@ -468,6 +468,7 @@ fn start_stream_with_state(
     config: StreamConfig,
 ) -> Result<(), String> {
     stop_existing_stream(state)?;
+    let requested_config = config.clone();
 
     let displays = enumerate_displays()?;
     let display = displays
@@ -479,7 +480,7 @@ fn start_stream_with_state(
     let encoder = choose_encoder(&config.ffmpeg_path, &config.encoder, &display)?;
     let config = effective_stream_config(config, &display, &encoder);
     let command = build_ffmpeg_command(&config, &display, &encoder)?;
-    persist_stream_config(&app, state, config.clone(), &display)?;
+    persist_stream_config(&app, state, requested_config.clone(), &display)?;
     let stop = Arc::new(AtomicBool::new(false));
     let child_slot = Arc::new(Mutex::new(None));
 
@@ -497,7 +498,7 @@ fn start_stream_with_state(
             ..StreamStats::default()
         };
         guard.selected_display_id = Some(config.display_id);
-        guard.last_config = Some(config.clone());
+        guard.last_config = Some(requested_config.clone());
     }
 
     let state_for_thread = state.0.clone();
@@ -874,71 +875,14 @@ fn parse_size_to_kbits(size: &str) -> u32 {
 fn effective_stream_config(
     mut config: StreamConfig,
     display: &DisplayInfo,
-    encoder: &str,
+    _encoder: &str,
 ) -> StreamConfig {
-    config = apply_default_low_latency_profile(config, encoder);
-    let max_recovery_gop = recovery_gop_for_resolution(&config, display);
-    if config.gop > max_recovery_gop {
-        config.gop = max_recovery_gop;
-    }
     if display.virtual_display {
         if config.fps > 60 {
             config.fps = 60;
         }
     }
     config
-}
-
-fn apply_default_low_latency_profile(mut config: StreamConfig, encoder: &str) -> StreamConfig {
-    match encoder {
-        "hevc_nvenc" if config.encoder == "auto" || looks_like_default_profile(&config) => {
-            config.fps = 60;
-            config.bitrate = NATIVE_TARGET_BITRATE.to_string();
-            config.bufsize = NATIVE_TARGET_BUFSIZE.to_string();
-            config.gop = NATIVE_TARGET_GOP_60;
-        }
-        "hevc_qsv" if config.encoder == "auto" || looks_like_default_profile(&config) => {
-            config.fps = 60;
-            config.bitrate = NATIVE_TARGET_BITRATE.to_string();
-            config.bufsize = NATIVE_TARGET_BUFSIZE.to_string();
-            config.gop = NATIVE_TARGET_GOP_60;
-        }
-        "libx265" if config.encoder == "auto" || looks_like_default_profile(&config) => {
-            config.fps = 60;
-            config.bitrate = NATIVE_TARGET_BITRATE.to_string();
-            config.bufsize = NATIVE_TARGET_BUFSIZE.to_string();
-            config.gop = NATIVE_TARGET_GOP_60;
-        }
-        _ => {}
-    }
-    config
-}
-
-fn looks_like_default_profile(config: &StreamConfig) -> bool {
-    config.fps == 60
-        && matches!(config.gop, 4 | 6 | 8)
-        && matches!(
-            config.bitrate.trim().to_ascii_uppercase().as_str(),
-            "12M" | "20M" | "35M" | "55M" | "70M" | "80M"
-        )
-}
-
-fn recovery_gop_for_resolution(config: &StreamConfig, display: &DisplayInfo) -> u32 {
-    let (width, height) = requested_output_dimensions(config, display);
-    let pixels = width.saturating_mul(height);
-    let fps = config.fps.max(1);
-    if pixels <= 2800 * 1840 {
-        // Keep recovery tight enough that dropped inter frames do not stay visible for multiple
-        // interaction frames while preserving the higher-quality profile that maintained cadence.
-        fps.saturating_add(14) / 15
-    } else {
-        fps.saturating_add(9) / 10
-    }
-    .max(1)
-}
-
-fn requested_output_dimensions(_config: &StreamConfig, display: &DisplayInfo) -> (u32, u32) {
-    (display.width.max(1) as u32, display.height.max(1) as u32)
 }
 
 fn quote_command(command: &[String]) -> String {
@@ -2416,7 +2360,7 @@ mod tests {
     }
 
     #[test]
-    fn effective_config_bounds_1080p_recovery_to_transport_friendly_gop() {
+    fn effective_config_preserves_manual_gop_for_1080p() {
         let mut config = test_config();
         config.gop = 60;
         let mut display = virtual_display();
@@ -2425,43 +2369,44 @@ mod tests {
 
         let config = effective_stream_config(config, &display, "hevc_qsv");
 
-        assert_eq!(config.gop, NATIVE_TARGET_GOP_60);
+        assert_eq!(config.gop, 60);
     }
 
     #[test]
-    fn effective_config_uses_longer_recovery_for_above_native_resolution() {
+    fn effective_config_preserves_manual_gop_for_above_native_resolution() {
         let mut config = test_config();
         config.gop = 60;
 
         let config = effective_stream_config(config, &virtual_display(), "hevc_nvenc");
 
-        assert_eq!(config.gop, 6);
+        assert_eq!(config.gop, 60);
     }
 
     #[test]
-    fn default_profile_keeps_nvenc_machines_at_low_latency_60() {
+    fn auto_encoder_does_not_rewrite_manual_video_timing() {
         let mut config = test_config();
         config.encoder = "auto".to_string();
+        config.fps = 45;
+        config.gop = 12;
 
         let config = effective_stream_config(config, &virtual_display(), "hevc_nvenc");
 
-        assert_eq!(config.fps, 60);
+        assert_eq!(config.fps, 45);
         assert_eq!(config.bitrate, NATIVE_TARGET_BITRATE);
         assert_eq!(config.bufsize, NATIVE_TARGET_BUFSIZE);
-        assert_eq!(config.gop, NATIVE_TARGET_GOP_60);
+        assert_eq!(config.gop, 12);
     }
 
     #[test]
-    fn default_profile_keeps_qsv_machines_at_low_latency_60() {
+    fn virtual_display_caps_runtime_fps_without_changing_gop() {
         let mut config = test_config();
-        config.encoder = "auto".to_string();
+        config.fps = 120;
+        config.gop = 30;
 
         let config = effective_stream_config(config, &virtual_display(), "hevc_qsv");
 
         assert_eq!(config.fps, 60);
-        assert_eq!(config.bitrate, NATIVE_TARGET_BITRATE);
-        assert_eq!(config.bufsize, NATIVE_TARGET_BUFSIZE);
-        assert_eq!(config.gop, NATIVE_TARGET_GOP_60);
+        assert_eq!(config.gop, 30);
     }
 
     #[test]

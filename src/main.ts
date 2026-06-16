@@ -335,8 +335,6 @@ for (const select of [displaySelect, encoderSelect, captureSelect]) {
 for (const control of [
   hdcPath,
   ffmpegPath,
-  encoderSelect,
-  captureSelect,
   fpsInput,
   bitrateInput,
   bufsizeInput,
@@ -346,6 +344,13 @@ for (const control of [
 ]) {
   control.addEventListener('input', scheduleSaveSettings);
   control.addEventListener('change', scheduleSaveSettings);
+}
+
+for (const select of [encoderSelect, captureSelect]) {
+  select.addEventListener('change', () => {
+    syncCustomSelect(select);
+    scheduleSaveSettings();
+  });
 }
 
 startButton.addEventListener('click', async () => {
