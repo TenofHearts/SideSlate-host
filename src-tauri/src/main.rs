@@ -497,9 +497,18 @@ fn start_stream_with_state(
         .cloned()
         .ok_or_else(|| format!("display {} not found", config.display_id))?;
 
-    let encoder = choose_encoder(&config.ffmpeg_path, &config.encoder, &display)?;
+    let native_capture = is_native_capture(&config.capture_backend);
+    let encoder = if native_capture {
+        "mf_hevc".to_string()
+    } else {
+        choose_encoder(&config.ffmpeg_path, &config.encoder, &display)?
+    };
     let config = effective_stream_config(config, &display, &encoder);
-    let command = build_ffmpeg_command(&config, &display, &encoder)?;
+    let command = if native_capture {
+        native_video_command(&config, &display)
+    } else {
+        build_ffmpeg_command(&config, &display, &encoder)?
+    };
     persist_stream_config(&app, state, requested_config.clone(), &display)?;
     let stop = Arc::new(AtomicBool::new(false));
     let child_slot = Arc::new(Mutex::new(None));
@@ -926,6 +935,10 @@ fn is_dxgi_capture(capture_backend: &str) -> bool {
     )
 }
 
+fn is_native_capture(capture_backend: &str) -> bool {
+    capture_backend == "native_mf"
+}
+
 fn use_gpu_resident_dxgi(config: &StreamConfig, encoder: &str) -> bool {
     match config.capture_backend.as_str() {
         "ddagrab_zero_copy" => matches!(encoder, "hevc_nvenc" | "hevc_qsv"),
@@ -943,6 +956,8 @@ fn video_pipeline_name(config: &StreamConfig, encoder: &str) -> &'static str {
         "d3d11-nvenc"
     } else if matches!(encoder, "hevc_qsv") && use_gpu_resident_dxgi(config, encoder) {
         "d3d11-qsv"
+    } else if is_native_capture(&config.capture_backend) {
+        "native-mf"
     } else if is_dxgi_capture(&config.capture_backend) {
         "dxgi-cpu-download"
     } else if config.capture_backend == "gfxcapture" {
@@ -950,6 +965,15 @@ fn video_pipeline_name(config: &StreamConfig, encoder: &str) -> &'static str {
     } else {
         "gdi-cpu"
     }
+}
+
+fn native_video_command(config: &StreamConfig, display: &DisplayInfo) -> Vec<String> {
+    vec![
+        "native_mf".to_string(),
+        format!("display={}x{}", display.width.max(1), display.height.max(1)),
+        format!("fps={}", config.fps),
+        format!("bitrate={}", config.bitrate),
+    ]
 }
 
 fn ddagrab_device(display: &DisplayInfo) -> Result<(u32, u32), String> {
@@ -981,7 +1005,7 @@ fn ddagrab_device(display: &DisplayInfo) -> Result<(u32, u32), String> {
 fn ddagrab_input(config: &StreamConfig, display: &DisplayInfo) -> Result<String, String> {
     let (_, output_idx) = ddagrab_device(display)?;
     Ok(format!(
-        "ddagrab=output_idx={}:framerate={}:draw_mouse=1:dup_frames=0:video_size={}x{}:output_fmt=bgra:allow_fallback=1",
+        "ddagrab=output_idx={}:framerate={}:draw_mouse=1:dup_frames=1:video_size={}x{}:output_fmt=bgra:allow_fallback=1",
         output_idx, config.fps, display.width, display.height
     ))
 }
@@ -1058,7 +1082,7 @@ fn build_ffmpeg_command(
         }
         other => {
             return Err(format!(
-                "unsupported capture backend '{}'; expected gdigrab, gfxcapture, ddagrab, ddagrab_zero_copy, or ddagrab_compat",
+                "unsupported capture backend '{}'; expected gdigrab, gfxcapture, ddagrab, ddagrab_zero_copy, ddagrab_compat, or native_mf",
                 other
             ));
         }
@@ -1126,11 +1150,7 @@ fn build_ffmpeg_command(
             "-preset".into(),
             "veryfast".into(),
             "-async_depth".into(),
-            "1".into(),
-            "-low_delay_brc".into(),
-            "1".into(),
-            "-forced_idr".into(),
-            "1".into(),
+            "2".into(),
             "-scenario".into(),
             "remotegaming".into(),
             "-gpb".into(),
@@ -1314,7 +1334,7 @@ fn run_stream_loop(
     let receiver_metrics = Arc::new(Mutex::new(ReceiverMetrics::default()));
 
     let mut encoded_source =
-        FfmpegEncodedVideoSource::start(state, app, encoder, command, child_slot)?;
+        EncodedVideoSource::start(state, app, encoder, config, display, command, child_slot)?;
 
     update_status(state, app, true, "streaming", encoder, "");
     let start = Instant::now();
@@ -1628,6 +1648,87 @@ struct SourceFinishReport {
 struct SourceFinishError {
     error: String,
     stderr_tail: String,
+}
+
+enum EncodedVideoSource {
+    Ffmpeg(FfmpegEncodedVideoSource),
+    Native(native_video::NativeHevcVideoSource),
+}
+
+impl EncodedVideoSource {
+    fn start(
+        state: &Arc<Mutex<AppStateInner>>,
+        app: &AppHandle,
+        encoder: &str,
+        config: &StreamConfig,
+        display: &DisplayInfo,
+        command: &[String],
+        child_slot: &Arc<Mutex<Option<Child>>>,
+    ) -> Result<Self, String> {
+        if is_native_capture(&config.capture_backend) {
+            update_status(
+                state,
+                app,
+                true,
+                "starting native Media Foundation",
+                encoder,
+                "",
+            );
+            let adapter_idx = display
+                .dxgi_adapter_idx
+                .ok_or_else(|| "selected display has no DXGI adapter mapping".to_string())?;
+            let output_idx = display
+                .dxgi_output_idx
+                .ok_or_else(|| "selected display has no DXGI output mapping".to_string())?;
+            let native =
+                native_video::NativeHevcVideoSource::start(native_video::NativeEncoderConfig {
+                    target: native_video::NativeDisplayTarget {
+                        adapter_idx,
+                        output_idx,
+                    },
+                    width: display.width.max(1) as u32,
+                    height: display.height.max(1) as u32,
+                    fps: config.fps,
+                    bitrate: parse_size_to_kbits(&config.bitrate).saturating_mul(1000),
+                })?;
+            return Ok(Self::Native(native));
+        }
+        FfmpegEncodedVideoSource::start(state, app, encoder, command, child_slot).map(Self::Ffmpeg)
+    }
+
+    fn recv_timeout(&mut self, timeout: Duration) -> Result<EncodedSourceEvent, String> {
+        match self {
+            Self::Ffmpeg(source) => source.recv_timeout(timeout),
+            Self::Native(source) => match source.recv_timeout(timeout)? {
+                native_video::NativeEncodedVideoEvent::Bytes(bytes) => {
+                    Ok(EncodedSourceEvent::Bytes(bytes))
+                }
+                native_video::NativeEncodedVideoEvent::Timeout => Ok(EncodedSourceEvent::Timeout),
+                native_video::NativeEncodedVideoEvent::Ended => Ok(EncodedSourceEvent::Ended),
+            },
+        }
+    }
+
+    fn finish(
+        self,
+        child_slot: &Arc<Mutex<Option<Child>>>,
+        user_requested_stop: bool,
+        stdout_eof: bool,
+    ) -> Result<SourceFinishReport, SourceFinishError> {
+        match self {
+            Self::Ffmpeg(source) => source.finish(child_slot, user_requested_stop, stdout_eof),
+            Self::Native(source) => match source.finish() {
+                Ok(exit_status) => Ok(SourceFinishReport {
+                    exit_status,
+                    stderr_tail: String::new(),
+                }),
+                Err(error) => Err(SourceFinishError {
+                    error,
+                    stderr_tail: String::new(),
+                }),
+            },
+        }
+    }
 }
 
 struct FfmpegEncodedVideoSource {
@@ -2179,7 +2280,7 @@ mod tests {
             .any(|window| window[0] == "-i" && window[1].contains("ddagrab=output_idx=0:")));
         assert!(command
             .windows(2)
-            .any(|window| window[0] == "-i" && window[1].contains("dup_frames=0")));
+            .any(|window| window[0] == "-i" && window[1].contains("dup_frames=1")));
         assert!(!command
             .windows(2)
             .any(|window| window[0] == "-i" && window[1].contains("ddagrab=output_idx=1:")));
@@ -2188,12 +2289,29 @@ mod tests {
     #[test]
     fn unsupported_capture_backend_fails_instead_of_falling_back() {
         let mut config = test_config();
-        config.capture_backend = "native_mf".to_string();
+        config.capture_backend = "unknown_backend".to_string();
 
         let error = build_ffmpeg_command(&config, &virtual_display(), "hevc_nvenc")
             .expect_err("unsupported backend should not silently run FFmpeg ddagrab");
 
-        assert!(error.contains("unsupported capture backend 'native_mf'"));
+        assert!(error.contains("unsupported capture backend 'unknown_backend'"));
+    }
+
+    #[test]
+    fn native_mf_uses_native_pipeline_name_and_command() {
+        let mut config = test_config();
+        config.capture_backend = "native_mf".to_string();
+
+        assert_eq!(video_pipeline_name(&config, "mf_hevc"), "native-mf");
+        assert_eq!(
+            native_video_command(&config, &virtual_display()),
+            vec![
+                "native_mf".to_string(),
+                "display=3840x2160".to_string(),
+                "fps=60".to_string(),
+                format!("bitrate={}", NATIVE_TARGET_BITRATE),
+            ]
+        );
     }
 
     #[test]
@@ -2262,6 +2380,11 @@ mod tests {
         assert!(!filter.contains("h="));
         assert!(!command.iter().any(|part| part == "-look_ahead"));
         assert!(!command.iter().any(|part| part == "-low_power"));
+        assert!(command
+            .windows(2)
+            .any(|window| window[0] == "-async_depth" && window[1] == "2"));
+        assert!(!command.iter().any(|part| part == "-forced_idr"));
+        assert!(!command.iter().any(|part| part == "-low_delay_brc"));
         assert!(!command.iter().any(|part| part == "-max_frame_size_i"));
         assert!(!command.iter().any(|part| part == "-max_frame_size_p"));
     }

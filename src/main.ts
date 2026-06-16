@@ -195,6 +195,7 @@ app.innerHTML = `
             <label>Capture
               <select id="captureSelect">
                 <option value="ddagrab">DXGI zero-copy when possible</option>
+                <option value="native_mf">Native Media Foundation HEVC</option>
                 <option value="ddagrab_zero_copy">DXGI zero-copy / NVENC</option>
                 <option value="ddagrab_compat">DXGI compatibility</option>
                 <option value="gfxcapture">Windows Graphics Capture experimental</option>
