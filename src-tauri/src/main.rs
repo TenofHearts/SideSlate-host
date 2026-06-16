@@ -1279,56 +1279,19 @@ fn run_stream_loop(
 ) -> Result<(), String> {
     if !config.hdc_path.trim().is_empty() {
         update_status(state, app, true, "resetting HDC forward", encoder, "");
-        reset_hdc_forward(&config.hdc_path)
-            .map_err(|err| format!("HDC forward reset failed: {}", err))?;
+        if let Err(err) = reset_hdc_forward(&config.hdc_path) {
+            update_status(
+                state,
+                app,
+                true,
+                "HDC forward unavailable; streaming will retry the configured port",
+                encoder,
+                &format!("HDC forward reset failed: {}", err),
+            );
+        }
     }
 
-    update_status(
-        state,
-        app,
-        true,
-        &format!("connecting to {}:{}", config.host, config.port),
-        encoder,
-        "",
-    );
-    let mut stream = connect_with_retry(config, state, app, encoder)?;
-    stream
-        .set_nodelay(true)
-        .map_err(|err| format!("set TCP_NODELAY failed: {}", err))?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(3)))
-        .map_err(|err| format!("set TCP read timeout failed: {}", err))?;
-    stream
-        .set_write_timeout(Some(Duration::from_secs(3)))
-        .map_err(|err| format!("set TCP write timeout failed: {}", err))?;
-
-    update_status(
-        state,
-        app,
-        true,
-        "performing protocol handshake",
-        encoder,
-        "",
-    );
-    protocol_handshake(&mut stream, config, display, command)?;
-    stream
-        .set_read_timeout(None)
-        .map_err(|err| format!("clear TCP read timeout failed: {}", err))?;
-    stream
-        .set_write_timeout(None)
-        .map_err(|err| format!("clear TCP write timeout failed: {}", err))?;
-    let mut receiver_stats_stream = stream
-        .try_clone()
-        .map_err(|err| format!("clone TCP stream for receiver stats failed: {}", err))?;
-    receiver_stats_stream
-        .set_read_timeout(Some(Duration::from_millis(500)))
-        .map_err(|err| format!("set receiver stats read timeout failed: {}", err))?;
     let receiver_metrics = Arc::new(Mutex::new(ReceiverMetrics::default()));
-    let receiver_stats_handle = {
-        let metrics = receiver_metrics.clone();
-        let stop = stop.clone();
-        thread::spawn(move || receiver_stats_loop(&mut receiver_stats_stream, metrics, stop))
-    };
 
     update_status(state, app, true, "starting ffmpeg", encoder, "");
     let mut child = hidden_command(&command[0])
@@ -1407,8 +1370,23 @@ fn run_stream_loop(
     let sender_handle = {
         let queue = sender_queue.clone();
         let metrics = sender_metrics.clone();
+        let receiver_metrics = receiver_metrics.clone();
         let stop = stop.clone();
-        thread::spawn(move || sender_loop(stream, queue, metrics, stop, send_pacer))
+        let config = config.clone();
+        let display = display.clone();
+        let command = command.to_vec();
+        thread::spawn(move || {
+            sender_loop(
+                config,
+                display,
+                command,
+                queue,
+                metrics,
+                receiver_metrics,
+                stop,
+                send_pacer,
+            )
+        })
     };
     let mut last_sent_vcl_packets = 0u64;
     let mut last_sent_bytes = 0u64;
@@ -1421,6 +1399,7 @@ fn run_stream_loop(
     let mut video_frame_index = 0u64;
     let idle_flush_interval = access_unit_idle_flush_interval(config.fps);
     let stats_interval = Duration::from_millis(500);
+    let (encode_width, encode_height) = output_dimensions(display, command);
     let mut log_file = open_stream_log();
     write_stream_log(
         &mut log_file,
@@ -1439,8 +1418,8 @@ fn run_stream_loop(
             display.dxgi_adapter_idx,
             display.dxgi_output_idx,
             display.dxgi_adapter_name,
-            display.width,
-            display.height,
+            encode_width,
+            encode_height,
             config.send_pacing,
             quote_command(command)
         ),
@@ -1599,7 +1578,6 @@ fn run_stream_loop(
     let _ = sender_handle.join();
     let user_requested_stop = stop.load(Ordering::SeqCst);
     stop.store(true, Ordering::SeqCst);
-    let _ = receiver_stats_handle.join();
 
     let mut ffmpeg_status_error = None;
     let mut ffmpeg_exit_status = None;
@@ -1735,39 +1713,6 @@ fn reset_hdc_forward(hdc_path: &str) -> Result<String, String> {
 
 fn close_hdc_forward(hdc_path: &str) -> Result<String, String> {
     run_text_command(hdc_path, &["fport", "rm", "tcp:17005", "tcp:7005"])
-}
-
-fn connect_with_retry(
-    config: &StreamConfig,
-    state: &Arc<Mutex<AppStateInner>>,
-    app: &AppHandle,
-    encoder: &str,
-) -> Result<TcpStream, String> {
-    let mut last_error = String::new();
-    for attempt in 1..=30 {
-        match TcpStream::connect((config.host.as_str(), config.port)) {
-            Ok(stream) => return Ok(stream),
-            Err(err) => {
-                last_error = err.to_string();
-                update_status(
-                    state,
-                    app,
-                    true,
-                    &format!(
-                        "waiting for receiver on {}:{} ({}/30)",
-                        config.host, config.port, attempt
-                    ),
-                    encoder,
-                    "",
-                );
-                thread::sleep(Duration::from_millis(300));
-            }
-        }
-    }
-    Err(format!(
-        "connect failed after HDC setup. Start the tablet receiver, then retry. Last error: {}",
-        last_error
-    ))
 }
 
 fn update_status(
@@ -2668,6 +2613,7 @@ struct SenderMetrics {
     sent_vcl_packets: u64,
     sent_keyframe_packets: u64,
     sent_bytes: u64,
+    transport_connected: bool,
     socket_write_blocked_events: u64,
     socket_write_blocked_ms: f64,
     max_socket_write_ms: f64,
@@ -2684,43 +2630,33 @@ struct ReceiverMetrics {
     last_error: String,
 }
 
-fn receiver_stats_loop(
-    stream: &mut TcpStream,
-    metrics: Arc<Mutex<ReceiverMetrics>>,
-    stop: Arc<AtomicBool>,
+fn handle_receiver_stats_message(
+    message: protocol::Message,
+    metrics: &Arc<Mutex<ReceiverMetrics>>,
 ) {
-    while !stop.load(Ordering::SeqCst) {
-        match protocol::read_message(stream) {
-            Ok(message) if message.message_type == protocol::TYPE_STATS => {
-                if let Some(stats) = protocol::parse_receiver_stats_payload(&message.payload) {
-                    if let Ok(mut guard) = metrics.lock() {
-                        guard.stats = stats;
-                        guard.stats_messages += 1;
-                        guard.last_error.clear();
-                    }
-                } else if let Ok(mut guard) = metrics.lock() {
-                    guard.last_error = "receiver stats payload too short".to_string();
-                }
-            }
-            Ok(message) if message.message_type == protocol::TYPE_KEYFRAME_REQUEST => {
+    match message.message_type {
+        protocol::TYPE_STATS => {
+            if let Some(stats) = protocol::parse_receiver_stats_payload(&message.payload) {
                 if let Ok(mut guard) = metrics.lock() {
-                    guard.last_error = "receiver requested keyframe; host-side request handling is not implemented yet".to_string();
+                    guard.stats = stats;
+                    guard.stats_messages += 1;
+                    guard.last_error.clear();
                 }
+            } else if let Ok(mut guard) = metrics.lock() {
+                guard.last_error = "receiver stats payload too short".to_string();
             }
-            Ok(message) => {
-                if let Ok(mut guard) = metrics.lock() {
-                    guard.last_error =
-                        format!("unexpected receiver message type {}", message.message_type);
-                }
+        }
+        protocol::TYPE_KEYFRAME_REQUEST => {
+            if let Ok(mut guard) = metrics.lock() {
+                guard.last_error =
+                    "receiver requested keyframe; host-side request handling is not implemented yet"
+                        .to_string();
             }
-            Err(error) => {
-                if stop.load(Ordering::SeqCst) || is_receiver_stats_timeout(&error) {
-                    continue;
-                }
-                if let Ok(mut guard) = metrics.lock() {
-                    guard.last_error = error;
-                }
-                break;
+        }
+        _ => {
+            if let Ok(mut guard) = metrics.lock() {
+                guard.last_error =
+                    format!("unexpected receiver message type {}", message.message_type);
             }
         }
     }
@@ -2769,16 +2705,59 @@ fn apply_receiver_metrics(stats: &mut StreamStats, receiver: &ReceiverMetrics) {
 }
 
 fn sender_loop(
-    mut stream: TcpStream,
+    config: StreamConfig,
+    display: DisplayInfo,
+    command: Vec<String>,
     queue: Arc<SenderQueue>,
     metrics: Arc<Mutex<SenderMetrics>>,
+    receiver_metrics: Arc<Mutex<ReceiverMetrics>>,
     stop: Arc<AtomicBool>,
     mut pacer: SendPacer,
 ) {
+    let mut stream: Option<TcpStream> = None;
+    let mut receiver_stats_stop: Option<Arc<AtomicBool>> = None;
+    let mut receiver_stats_handle: Option<JoinHandle<()>> = None;
+    let mut last_connect_attempt: Option<Instant> = None;
+
     while let Some(packet) = queue.pop(&stop) {
+        if stream.is_none() {
+            let retry_due = last_connect_attempt
+                .map(|attempt| attempt.elapsed() >= Duration::from_millis(300))
+                .unwrap_or(true);
+            if !retry_due {
+                continue;
+            }
+            last_connect_attempt = Some(Instant::now());
+
+            match connect_transport_once(&config, &display, &command, &receiver_metrics, &stop) {
+                Ok(session) => {
+                    stream = Some(session.stream);
+                    receiver_stats_stop = Some(session.receiver_stats_stop);
+                    receiver_stats_handle = Some(session.receiver_stats_handle);
+                    if let Ok(mut guard) = metrics.lock() {
+                        guard.transport_connected = true;
+                        guard.last_error.clear();
+                    }
+                }
+                Err(error) => {
+                    if let Ok(mut guard) = metrics.lock() {
+                        guard.transport_connected = false;
+                        guard.last_error = format!(
+                            "receiver unavailable on {}:{}; dropping stale packets until it appears ({})",
+                            config.host, config.port, error
+                        );
+                    }
+                    continue;
+                }
+            }
+        }
+
         let write_start = Instant::now();
+        let Some(active_stream) = stream.as_mut() else {
+            continue;
+        };
         let result = send_packet(
-            &mut stream,
+            active_stream,
             packet.sequence,
             packet.timestamp_us,
             packet.flags,
@@ -2813,24 +2792,119 @@ fn sender_loop(
             }
             Err(error) => {
                 if let Ok(mut guard) = metrics.lock() {
+                    guard.transport_connected = false;
                     guard.last_error = error;
                 }
-                stop.store(true, Ordering::SeqCst);
-                break;
+                close_receiver_stats(&mut receiver_stats_stop, &mut receiver_stats_handle);
+                reset_receiver_metrics(&receiver_metrics);
+                stream = None;
             }
         }
     }
 
-    let _ = protocol::write_message(
-        &mut stream,
-        &protocol::Message {
-            message_type: protocol::TYPE_STOP,
-            flags: 0,
-            sequence: 0,
-            timestamp_us: 0,
-            payload: Vec::new(),
-        },
-    );
+    if let Some(mut stream) = stream {
+        let _ = protocol::write_message(
+            &mut stream,
+            &protocol::Message {
+                message_type: protocol::TYPE_STOP,
+                flags: 0,
+                sequence: 0,
+                timestamp_us: 0,
+                payload: Vec::new(),
+            },
+        );
+    }
+    close_receiver_stats(&mut receiver_stats_stop, &mut receiver_stats_handle);
+    if let Ok(mut guard) = metrics.lock() {
+        guard.transport_connected = false;
+    }
+}
+
+struct TransportSession {
+    stream: TcpStream,
+    receiver_stats_stop: Arc<AtomicBool>,
+    receiver_stats_handle: JoinHandle<()>,
+}
+
+fn connect_transport_once(
+    config: &StreamConfig,
+    display: &DisplayInfo,
+    command: &[String],
+    receiver_metrics: &Arc<Mutex<ReceiverMetrics>>,
+    stop: &Arc<AtomicBool>,
+) -> Result<TransportSession, String> {
+    let mut stream = TcpStream::connect((config.host.as_str(), config.port))
+        .map_err(|err| format!("connect failed: {}", err))?;
+    stream
+        .set_nodelay(true)
+        .map_err(|err| format!("set TCP_NODELAY failed: {}", err))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .map_err(|err| format!("set TCP read timeout failed: {}", err))?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(3)))
+        .map_err(|err| format!("set TCP write timeout failed: {}", err))?;
+    protocol_handshake(&mut stream, config, display, command)?;
+    stream
+        .set_read_timeout(None)
+        .map_err(|err| format!("clear TCP read timeout failed: {}", err))?;
+    stream
+        .set_write_timeout(None)
+        .map_err(|err| format!("clear TCP write timeout failed: {}", err))?;
+
+    let mut receiver_stats_stream = stream
+        .try_clone()
+        .map_err(|err| format!("clone TCP stream for receiver stats failed: {}", err))?;
+    receiver_stats_stream
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .map_err(|err| format!("set receiver stats read timeout failed: {}", err))?;
+    reset_receiver_metrics(receiver_metrics);
+    let receiver_stats_stop = Arc::new(AtomicBool::new(false));
+    let receiver_stats_handle = {
+        let metrics = receiver_metrics.clone();
+        let session_stop = receiver_stats_stop.clone();
+        let stream_stop = stop.clone();
+        thread::spawn(move || {
+            while !session_stop.load(Ordering::SeqCst) && !stream_stop.load(Ordering::SeqCst) {
+                match protocol::read_message(&mut receiver_stats_stream) {
+                    Ok(message) => handle_receiver_stats_message(message, &metrics),
+                    Err(error) => {
+                        if session_stop.load(Ordering::SeqCst)
+                            || stream_stop.load(Ordering::SeqCst)
+                            || is_receiver_stats_timeout(&error)
+                        {
+                            continue;
+                        }
+                        if let Ok(mut guard) = metrics.lock() {
+                            guard.last_error = error;
+                        }
+                        break;
+                    }
+                }
+            }
+        })
+    };
+
+    Ok(TransportSession {
+        stream,
+        receiver_stats_stop,
+        receiver_stats_handle,
+    })
+}
+
+fn close_receiver_stats(stop: &mut Option<Arc<AtomicBool>>, handle: &mut Option<JoinHandle<()>>) {
+    if let Some(stop) = stop.take() {
+        stop.store(true, Ordering::SeqCst);
+    }
+    if let Some(handle) = handle.take() {
+        let _ = handle.join();
+    }
+}
+
+fn reset_receiver_metrics(receiver_metrics: &Arc<Mutex<ReceiverMetrics>>) {
+    if let Ok(mut guard) = receiver_metrics.lock() {
+        *guard = ReceiverMetrics::default();
+    }
 }
 
 fn flags_for_nal(nal: &[u8]) -> u16 {
