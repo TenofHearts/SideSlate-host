@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::mem::size_of;
 use std::net::TcpStream;
 #[cfg(windows)]
@@ -54,6 +54,8 @@ const MENU_REFRESH_DISPLAYS: &str = "refresh_displays";
 const MENU_EXIT: &str = "exit";
 const MENU_DISPLAY_PREFIX: &str = "display:";
 const SETTINGS_FILE: &str = "host-settings.json";
+const STREAM_LOG_MAX_BYTES: u64 = 512 * 1024;
+const STREAM_LOG_TRIM_TARGET_BYTES: u64 = 384 * 1024;
 
 #[derive(Clone, Serialize, Deserialize)]
 struct DisplayInfo {
@@ -1946,14 +1948,66 @@ fn open_stream_log() -> Option<std::fs::File> {
     let path = std::env::current_dir()
         .unwrap_or_else(|_| std::path::PathBuf::from("."))
         .join("sideslate-stream.log");
-    OpenOptions::new().create(true).append(true).open(path).ok()
+    OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(path)
+        .ok()
 }
 
 fn write_stream_log(log_file: &mut Option<std::fs::File>, message: &str) {
     let Some(file) = log_file.as_mut() else {
         return;
     };
-    let _ = writeln!(file, "{:.3} {}", timestamp_seconds(), message);
+    let mut entry = format!("{:.3} {}\n", timestamp_seconds(), message);
+    if entry.len() as u64 > STREAM_LOG_MAX_BYTES {
+        entry = trim_utf8_prefix_to_byte_len(&entry, STREAM_LOG_MAX_BYTES as usize);
+    }
+    let _ = trim_stream_log_for_append(file, entry.len() as u64);
+    let _ = file.seek(SeekFrom::End(0));
+    let _ = file.write_all(entry.as_bytes());
+}
+
+fn trim_stream_log_for_append(file: &mut std::fs::File, append_bytes: u64) -> std::io::Result<()> {
+    let current_len = file.metadata()?.len();
+    if current_len.saturating_add(append_bytes) <= STREAM_LOG_MAX_BYTES {
+        return Ok(());
+    }
+
+    let retain_bytes = STREAM_LOG_TRIM_TARGET_BYTES.min(STREAM_LOG_MAX_BYTES - append_bytes);
+    if retain_bytes == 0 {
+        file.set_len(0)?;
+        file.seek(SeekFrom::Start(0))?;
+        return Ok(());
+    }
+
+    let start = current_len.saturating_sub(retain_bytes);
+    file.seek(SeekFrom::Start(start))?;
+    let mut tail = Vec::with_capacity(retain_bytes as usize);
+    file.read_to_end(&mut tail)?;
+    let first_newline = tail.iter().position(|byte| *byte == b'\n');
+    if let Some(index) = first_newline {
+        tail.drain(..=index);
+    }
+
+    file.set_len(0)?;
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(&tail)?;
+    file.seek(SeekFrom::End(0))?;
+    Ok(())
+}
+
+fn trim_utf8_prefix_to_byte_len(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+
+    let mut start = value.len() - max_bytes;
+    while !value.is_char_boundary(start) {
+        start += 1;
+    }
+    value[start..].to_string()
 }
 
 fn write_stats_log(log_file: &mut Option<std::fs::File>, stats: &StreamStats) {
@@ -2282,6 +2336,7 @@ fn access_unit_idle_flush_interval(fps: u32) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn test_config() -> StreamConfig {
         StreamConfig {
@@ -2298,6 +2353,26 @@ mod tests {
             host: "127.0.0.1".to_string(),
             port: 5000,
         }
+    }
+
+    fn temp_log_file(name: &str) -> (PathBuf, std::fs::File) {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "sideslate-test-{}-{}-{}.log",
+            name,
+            std::process::id(),
+            unique
+        ));
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("test log should open");
+        (path, file)
     }
 
     fn virtual_display() -> DisplayInfo {
@@ -2769,6 +2844,49 @@ mod tests {
             pacer.target_delay_for_sent(pacer.burst_bytes + 512 * 1024),
             Duration::from_millis(6)
         );
+    }
+
+    #[test]
+    fn stream_log_write_keeps_file_under_512_kib() {
+        let (path, file) = temp_log_file("bounded");
+        let mut log_file = Some(file);
+        let message = "x".repeat(4096);
+
+        for _ in 0..200 {
+            write_stream_log(&mut log_file, &message);
+        }
+
+        drop(log_file);
+        let len = fs::metadata(&path).expect("test log metadata").len();
+        let _ = fs::remove_file(&path);
+        assert!(
+            len <= STREAM_LOG_MAX_BYTES,
+            "log length {} exceeded cap {}",
+            len,
+            STREAM_LOG_MAX_BYTES
+        );
+    }
+
+    #[test]
+    fn stream_log_trim_keeps_recent_complete_lines() {
+        let (path, mut file) = temp_log_file("recent-lines");
+        let old_line = format!("old{}\n", "x".repeat(1024));
+        while file.metadata().expect("metadata").len() < STREAM_LOG_MAX_BYTES + 64 * 1024 {
+            file.write_all(old_line.as_bytes()).expect("write old line");
+        }
+        file.write_all(b"recent-marker\n")
+            .expect("write recent marker");
+
+        trim_stream_log_for_append(&mut file, 128).expect("trim log");
+        file.write_all(b"new-marker\n").expect("write new marker");
+        drop(file);
+
+        let contents = fs::read_to_string(&path).expect("read trimmed log");
+        let len = fs::metadata(&path).expect("test log metadata").len();
+        let _ = fs::remove_file(&path);
+        assert!(len <= STREAM_LOG_MAX_BYTES);
+        assert!(contents.contains("recent-marker"));
+        assert!(contents.contains("new-marker"));
     }
 
     #[test]
