@@ -1431,6 +1431,10 @@ fn run_stream_loop(
                 ffmpeg_read_bytes += chunk.len() as u64;
                 access_unit_parser.push(&chunk)
             }
+            Ok(EncodedSourceEvent::Notice(notice)) => {
+                write_stream_log(&mut log_file, &notice);
+                Vec::new()
+            }
             Ok(EncodedSourceEvent::Timeout) => access_unit_parser.flush_idle(),
             Ok(EncodedSourceEvent::Ended) => {
                 ffmpeg_stdout_eof = true;
@@ -1642,6 +1646,7 @@ fn run_stream_loop(
 
 enum EncodedSourceEvent {
     Bytes(Vec<u8>),
+    Notice(String),
     Timeout,
     Ended,
 }
@@ -1708,6 +1713,9 @@ impl EncodedVideoSource {
             Self::Native(source) => match source.recv_timeout(timeout)? {
                 native_video::NativeEncodedVideoEvent::Bytes(bytes) => {
                     Ok(EncodedSourceEvent::Bytes(bytes))
+                }
+                native_video::NativeEncodedVideoEvent::Notice(notice) => {
+                    Ok(EncodedSourceEvent::Notice(notice))
                 }
                 native_video::NativeEncodedVideoEvent::Timeout => Ok(EncodedSourceEvent::Timeout),
                 native_video::NativeEncodedVideoEvent::Ended => Ok(EncodedSourceEvent::Ended),

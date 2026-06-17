@@ -2,21 +2,22 @@ use serde::Serialize;
 use std::mem::ManuallyDrop;
 use std::time::{Duration, Instant};
 use windows::core::{Interface, PWSTR, VARIANT};
-use windows::Win32::Foundation::{BOOL, HANDLE, HMODULE, POINT};
+use windows::Win32::Foundation::{BOOL, HANDLE, HMODULE, POINT, RECT};
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
 };
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, ID3D11VideoContext,
-    ID3D11VideoDevice, ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator,
-    D3D11_BIND_RENDER_TARGET, D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-    D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_SDK_VERSION,
-    D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
-    D3D11_USAGE_STAGING, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE, D3D11_VIDEO_PROCESSOR_CONTENT_DESC,
-    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0,
-    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0,
-    D3D11_VIDEO_PROCESSOR_STREAM, D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
-    D3D11_VPIV_DIMENSION_TEXTURE2D, D3D11_VPOV_DIMENSION_TEXTURE2D,
+    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Multithread, ID3D11Texture2D,
+    ID3D11VideoContext, ID3D11VideoDevice, ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator,
+    D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_CPU_ACCESS_READ,
+    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_MAPPED_SUBRESOURCE,
+    D3D11_MAP_READ, D3D11_SDK_VERSION, D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV, D3D11_TEXTURE2D_DESC,
+    D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
+    D3D11_VIDEO_PROCESSOR_CONTENT_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC,
+    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC,
+    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0, D3D11_VIDEO_PROCESSOR_STREAM,
+    D3D11_VIDEO_USAGE_PLAYBACK_NORMAL, D3D11_VPIV_DIMENSION_TEXTURE2D,
+    D3D11_VPOV_DIMENSION_TEXTURE2D,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12, DXGI_FORMAT_R8G8B8A8_UNORM,
@@ -126,6 +127,7 @@ pub fn probe_native_video(target: NativeDisplayTarget) -> Result<NativeVideoProb
 
 pub enum NativeEncodedVideoEvent {
     Bytes(Vec<u8>),
+    Notice(String),
     Timeout,
     Ended,
 }
@@ -145,6 +147,7 @@ const MF_HEVC_RATE_BUFFER_BYTES: u32 = 256 * 1024;
 pub struct NativeHevcVideoSource {
     _session: MediaFoundationSession,
     duplication: IDXGIOutputDuplication,
+    device: ID3D11Device,
     device_context: ID3D11DeviceContext,
     gpu_input: Option<GpuInputPath>,
     staging_texture: Option<ID3D11Texture2D>,
@@ -163,10 +166,13 @@ pub struct NativeHevcVideoSource {
     desktop_left: i32,
     desktop_top: i32,
     fps: u32,
+    bitrate: u32,
     frame_duration: Duration,
     next_frame_due: Instant,
     frame_index: u64,
+    gpu_has_frame: bool,
     last_nv12: Option<Vec<u8>>,
+    pending_notice: Option<String>,
     pointer: PointerState,
     ended: bool,
 }
@@ -181,6 +187,71 @@ struct PointerState {
 struct PointerShape {
     info: DXGI_OUTDUPL_POINTER_SHAPE_INFO,
     bytes: Vec<u8>,
+}
+
+struct CursorOverlay<'a> {
+    bytes: &'a [u8],
+    width: u32,
+    height: u32,
+    pitch: u32,
+    source_rect: RECT,
+    dest_rect: RECT,
+}
+
+fn cursor_overlay<'a>(
+    pointer: &'a PointerState,
+    frame_width: u32,
+    frame_height: u32,
+) -> Option<CursorOverlay<'a>> {
+    if !pointer.visible {
+        return None;
+    }
+    let shape = pointer.shape.as_ref()?;
+    if shape.info.Type != DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR.0 as u32 {
+        return None;
+    }
+    let width = shape.info.Width;
+    let height = shape.info.Height;
+    let pitch = shape.info.Pitch;
+    if width == 0 || height == 0 || pitch < width.saturating_mul(4) {
+        return None;
+    }
+    if shape.bytes.len() < pitch as usize * height as usize {
+        return None;
+    }
+
+    let origin_x = pointer.position.x - shape.info.HotSpot.x;
+    let origin_y = pointer.position.y - shape.info.HotSpot.y;
+    let dest_left = origin_x.max(0);
+    let dest_top = origin_y.max(0);
+    let dest_right = (origin_x + width as i32).min(frame_width as i32);
+    let dest_bottom = (origin_y + height as i32).min(frame_height as i32);
+    if dest_left >= dest_right || dest_top >= dest_bottom {
+        return None;
+    }
+    let source_left = dest_left - origin_x;
+    let source_top = dest_top - origin_y;
+    let source_right = source_left + (dest_right - dest_left);
+    let source_bottom = source_top + (dest_bottom - dest_top);
+
+    Some(CursorOverlay {
+        bytes: &shape.bytes,
+        width,
+        height,
+        pitch,
+        source_rect: RECT {
+            left: source_left,
+            top: source_top,
+            right: source_right,
+            bottom: source_bottom,
+        },
+        dest_rect: RECT {
+            left: dest_left,
+            top: dest_top,
+            right: dest_right,
+            bottom: dest_bottom,
+        },
+    })
 }
 
 impl NativeHevcVideoSource {
@@ -205,36 +276,27 @@ impl NativeHevcVideoSource {
             ));
         }
 
-        let gpu_input: Result<GpuInputPath, String> =
-            Err("native GPU input path is disabled after black-frame output on Arc/MF".to_string());
+        protect_d3d11_multithread(&capture.device);
+        let gpu_input = GpuInputPath::new(
+            &capture.device,
+            &capture.device_context,
+            width,
+            height,
+            config.fps,
+            capture.desc.ModeDesc.Format,
+        )
+        .and_then(|gpu_input| {
+            create_configured_hevc_encoder(
+                width,
+                height,
+                config.fps,
+                config.bitrate,
+                Some(&gpu_input.device_manager),
+            )
+            .map(|encoder| (gpu_input, encoder))
+        });
         let (gpu_input, encoder, staging_texture) = match gpu_input {
-            Ok(gpu_input) => {
-                match create_configured_hevc_encoder(
-                    width,
-                    height,
-                    config.fps,
-                    config.bitrate,
-                    Some(&gpu_input.device_manager),
-                ) {
-                    Ok(encoder) => (Some(gpu_input), encoder, None),
-                    Err(_) => {
-                        let staging_texture = create_staging_texture(
-                            &capture.device,
-                            width,
-                            height,
-                            capture.desc.ModeDesc.Format,
-                        )?;
-                        let encoder = create_configured_hevc_encoder(
-                            width,
-                            height,
-                            config.fps,
-                            config.bitrate,
-                            None,
-                        )?;
-                        (None, encoder, Some(staging_texture))
-                    }
-                }
-            }
+            Ok((gpu_input, encoder)) => (Some(gpu_input), encoder, None),
             Err(_) => {
                 let staging_texture = create_staging_texture(
                     &capture.device,
@@ -271,6 +333,7 @@ impl NativeHevcVideoSource {
         let mut source = Self {
             _session: session,
             duplication: capture.duplication,
+            device: capture.device,
             device_context: capture.device_context,
             gpu_input,
             staging_texture,
@@ -289,10 +352,13 @@ impl NativeHevcVideoSource {
             desktop_left: capture.desktop_left,
             desktop_top: capture.desktop_top,
             fps,
+            bitrate: config.bitrate,
             frame_duration,
             next_frame_due: Instant::now(),
             frame_index: 0,
+            gpu_has_frame: false,
             last_nv12: None,
+            pending_notice: None,
             pointer: PointerState::default(),
             ended: false,
         };
@@ -303,6 +369,9 @@ impl NativeHevcVideoSource {
     pub fn recv_timeout(&mut self, timeout: Duration) -> Result<NativeEncodedVideoEvent, String> {
         if self.ended {
             return Ok(NativeEncodedVideoEvent::Ended);
+        }
+        if let Some(notice) = self.pending_notice.take() {
+            return Ok(NativeEncodedVideoEvent::Notice(notice));
         }
         let now = Instant::now();
         if now < self.next_frame_due {
@@ -321,20 +390,31 @@ impl NativeHevcVideoSource {
         }
 
         let bytes = if self.gpu_input.is_some() {
-            if !self.capture_gpu_if_updated()? {
-                self.next_frame_due = Instant::now() + self.frame_duration;
-                return Ok(NativeEncodedVideoEvent::Timeout);
+            match self.recv_gpu_encoded_frame() {
+                Ok(Some(bytes)) => bytes,
+                Ok(None) => {
+                    self.next_frame_due = Instant::now() + self.frame_duration;
+                    return Ok(NativeEncodedVideoEvent::Timeout);
+                }
+                Err(error) => {
+                    self.switch_to_cpu_path(&error)?;
+                    match self.recv_cpu_encoded_frame()? {
+                        Some(bytes) => bytes,
+                        None => {
+                            self.next_frame_due = Instant::now() + self.frame_duration;
+                            return Ok(NativeEncodedVideoEvent::Timeout);
+                        }
+                    }
+                }
             }
-            self.encode_gpu_texture()?
         } else {
-            if let Some(nv12) = self.capture_nv12_if_updated()? {
-                self.last_nv12 = Some(nv12);
+            match self.recv_cpu_encoded_frame()? {
+                Some(bytes) => bytes,
+                None => {
+                    self.next_frame_due = Instant::now() + self.frame_duration;
+                    return Ok(NativeEncodedVideoEvent::Timeout);
+                }
             }
-            let Some(nv12) = self.last_nv12.clone() else {
-                self.next_frame_due = Instant::now() + self.frame_duration;
-                return Ok(NativeEncodedVideoEvent::Timeout);
-            };
-            self.encode_nv12(&nv12)?
         };
         self.frame_index = self.frame_index.saturating_add(1);
         self.next_frame_due += self.frame_duration;
@@ -354,6 +434,71 @@ impl NativeHevcVideoSource {
             )
         };
         Ok(Some("native_mf".to_string()))
+    }
+
+    fn recv_gpu_encoded_frame(&mut self) -> Result<Option<Vec<u8>>, String> {
+        if self.capture_gpu_if_updated()? {
+            self.gpu_has_frame = true;
+        }
+        if !self.gpu_has_frame {
+            return Ok(None);
+        }
+        self.encode_gpu_texture().map(Some)
+    }
+
+    fn recv_cpu_encoded_frame(&mut self) -> Result<Option<Vec<u8>>, String> {
+        if let Some(nv12) = self.capture_nv12_if_updated()? {
+            self.last_nv12 = Some(nv12);
+        }
+        let Some(nv12) = self.last_nv12.clone() else {
+            return Ok(None);
+        };
+        self.encode_nv12(&nv12).map(Some)
+    }
+
+    fn switch_to_cpu_path(&mut self, gpu_error: &str) -> Result<(), String> {
+        if self.gpu_input.is_none() {
+            return Err(gpu_error.to_string());
+        }
+        let staging_texture =
+            create_staging_texture(&self.device, self.width, self.height, self.capture_format)?;
+        let encoder =
+            create_configured_hevc_encoder(self.width, self.height, self.fps, self.bitrate, None)
+                .map_err(|cpu_error| {
+                format!(
+                    "native_mf GPU path failed: {}; CPU fallback setup failed: {}",
+                    gpu_error, cpu_error
+                )
+            })?;
+        let output_info = unsafe { encoder.GetOutputStreamInfo(0) }
+            .map_err(|error| format!("CPU fallback GetOutputStreamInfo failed: {}", error))?;
+        let output_type = unsafe { encoder.GetOutputCurrentType(0) }
+            .map_err(|error| format!("CPU fallback GetOutputCurrentType failed: {}", error))?;
+        self.nalu_length_size = unsafe { output_type.GetUINT32(&MF_NALU_LENGTH_SET) }
+            .ok()
+            .and_then(|value| usize::try_from(value).ok())
+            .filter(|value| (1..=4).contains(value));
+        self.sequence_header =
+            media_type_blob(&output_type, &MF_MT_MPEG_SEQUENCE_HEADER).unwrap_or_default();
+        self.sequence_header_sent = false;
+        self.output_provides_samples =
+            output_info.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 as u32 != 0;
+        self.output_buffer_size = output_info
+            .cbSize
+            .max(self.width.saturating_mul(self.height));
+        self.encoder_events = encoder.cast::<IMFMediaEventGenerator>().ok();
+        self.encoder_needs_input = self.encoder_events.is_none();
+        self.encoder_has_output = false;
+        self.encoder = encoder;
+        self.gpu_input = None;
+        self.staging_texture = Some(staging_texture);
+        self.gpu_has_frame = false;
+        self.last_nv12 = None;
+        self.pending_notice = Some(format!(
+            "native_mf GPU path failed, switched to CPU staging path: {}",
+            gpu_error
+        ));
+        Ok(())
     }
 
     fn capture_nv12_if_updated(&mut self) -> Result<Option<Vec<u8>>, String> {
@@ -491,14 +636,15 @@ impl NativeHevcVideoSource {
         }
 
         let result = (|| {
+            self.update_pointer_from_frame(&frame_info)?;
             let resource = resource.ok_or_else(|| "DXGI frame had no resource".to_string())?;
             let texture: ID3D11Texture2D = resource
                 .cast()
                 .map_err(|error| format!("DXGI frame texture cast failed: {}", error))?;
             self.gpu_input
-                .as_ref()
+                .as_mut()
                 .ok_or_else(|| "native_mf GPU input path is not available".to_string())?
-                .convert_to_nv12(&texture, self.frame_index as u32)
+                .convert_to_nv12(&texture, self.frame_index as u32, &self.pointer)
         })();
         let release_result = unsafe { self.duplication.ReleaseFrame() }
             .map_err(|error| format!("native_mf ReleaseFrame failed: {}", error));
@@ -663,17 +809,27 @@ impl NativeHevcVideoSource {
     }
 }
 
-#[allow(dead_code)]
 struct GpuInputPath {
+    device: ID3D11Device,
     video_device: ID3D11VideoDevice,
     video_context: ID3D11VideoContext,
+    device_context: ID3D11DeviceContext,
     enumerator: ID3D11VideoProcessorEnumerator,
     processor: ID3D11VideoProcessor,
+    input_texture: ID3D11Texture2D,
+    cursor_texture: Option<CursorGpuTexture>,
     nv12_texture: ID3D11Texture2D,
     device_manager: IMFDXGIDeviceManager,
+    width: u32,
+    height: u32,
 }
 
-#[allow(dead_code)]
+struct CursorGpuTexture {
+    texture: ID3D11Texture2D,
+    width: u32,
+    height: u32,
+}
+
 impl GpuInputPath {
     fn new(
         device: &ID3D11Device,
@@ -681,6 +837,7 @@ impl GpuInputPath {
         width: u32,
         height: u32,
         fps: u32,
+        input_format: DXGI_FORMAT,
     ) -> Result<Self, String> {
         let device_manager = create_dxgi_device_manager(device)?;
         let video_device: ID3D11VideoDevice = device
@@ -709,24 +866,46 @@ impl GpuInputPath {
             .map_err(|error| format!("CreateVideoProcessorEnumerator failed: {}", error))?;
         let processor = unsafe { video_device.CreateVideoProcessor(&enumerator, 0) }
             .map_err(|error| format!("CreateVideoProcessor failed: {}", error))?;
+        let input_texture = create_default_texture(
+            device,
+            width,
+            height,
+            input_format,
+            (D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE).0 as u32,
+        )?;
         let nv12_texture = create_default_texture(
             device,
             width,
             height,
             DXGI_FORMAT_NV12,
-            D3D11_BIND_RENDER_TARGET.0 as u32,
+            (D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE).0 as u32,
         )?;
         Ok(Self {
+            device: device.clone(),
             video_device,
             video_context,
+            device_context: device_context.clone(),
             enumerator,
             processor,
+            input_texture,
+            cursor_texture: None,
             nv12_texture,
             device_manager,
+            width,
+            height,
         })
     }
 
-    fn convert_to_nv12(&self, source: &ID3D11Texture2D, frame_index: u32) -> Result<(), String> {
+    fn convert_to_nv12(
+        &mut self,
+        source: &ID3D11Texture2D,
+        frame_index: u32,
+        pointer: &PointerState,
+    ) -> Result<(), String> {
+        unsafe {
+            self.device_context
+                .CopyResource(&self.input_texture, source);
+        }
         let input_desc = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
             FourCC: 0,
             ViewDimension: D3D11_VPIV_DIMENSION_TEXTURE2D,
@@ -740,7 +919,7 @@ impl GpuInputPath {
         let mut input_view = None;
         unsafe {
             self.video_device.CreateVideoProcessorInputView(
-                source,
+                &self.input_texture,
                 &self.enumerator,
                 &input_desc,
                 Some(&mut input_view),
@@ -749,6 +928,7 @@ impl GpuInputPath {
         .map_err(|error| format!("CreateVideoProcessorInputView failed: {}", error))?;
         let input_view = input_view
             .ok_or_else(|| "CreateVideoProcessorInputView returned no view".to_string())?;
+        let cursor_stream = self.cursor_stream(pointer)?;
 
         let output_desc = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
             ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2D,
@@ -782,7 +962,11 @@ impl GpuInputPath {
             pInputSurfaceRight: ManuallyDrop::new(None),
             ppFutureSurfacesRight: std::ptr::null_mut(),
         };
-        let mut streams = [stream];
+        let mut streams = if let Some(cursor_stream) = cursor_stream {
+            vec![stream, cursor_stream]
+        } else {
+            vec![stream]
+        };
         unsafe {
             self.video_context.VideoProcessorBlt(
                 &self.processor,
@@ -792,13 +976,126 @@ impl GpuInputPath {
             )
         }
         .map_err(|error| format!("VideoProcessorBlt failed: {}", error))?;
+        unsafe {
+            self.device_context.Flush();
+        }
         let _ = unsafe { ManuallyDrop::take(&mut streams[0].pInputSurface) };
         let _ = unsafe { ManuallyDrop::take(&mut streams[0].pInputSurfaceRight) };
+        if streams.len() > 1 {
+            let _ = unsafe { ManuallyDrop::take(&mut streams[1].pInputSurface) };
+            let _ = unsafe { ManuallyDrop::take(&mut streams[1].pInputSurfaceRight) };
+        }
         Ok(())
     }
 
+    fn cursor_stream(
+        &mut self,
+        pointer: &PointerState,
+    ) -> Result<Option<D3D11_VIDEO_PROCESSOR_STREAM>, String> {
+        let Some(cursor) = cursor_overlay(pointer, self.width, self.height) else {
+            return Ok(None);
+        };
+        let texture = self.cursor_texture(&cursor)?;
+        let input_desc = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
+            FourCC: 0,
+            ViewDimension: D3D11_VPIV_DIMENSION_TEXTURE2D,
+            Anonymous: D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0 {
+                Texture2D: D3D11_TEX2D_VPIV {
+                    MipSlice: 0,
+                    ArraySlice: 0,
+                },
+            },
+        };
+        let mut input_view = None;
+        unsafe {
+            self.video_device.CreateVideoProcessorInputView(
+                &texture,
+                &self.enumerator,
+                &input_desc,
+                Some(&mut input_view),
+            )
+        }
+        .map_err(|error| format!("CreateVideoProcessorInputView(cursor) failed: {}", error))?;
+        let input_view = input_view
+            .ok_or_else(|| "CreateVideoProcessorInputView(cursor) returned no view".to_string())?;
+        unsafe {
+            self.video_context.VideoProcessorSetStreamSourceRect(
+                &self.processor,
+                1,
+                true,
+                Some(&cursor.source_rect),
+            );
+            self.video_context.VideoProcessorSetStreamDestRect(
+                &self.processor,
+                1,
+                true,
+                Some(&cursor.dest_rect),
+            );
+            self.video_context
+                .VideoProcessorSetStreamAlpha(&self.processor, 1, true, 1.0);
+        }
+        Ok(Some(D3D11_VIDEO_PROCESSOR_STREAM {
+            Enable: BOOL(1),
+            OutputIndex: 0,
+            InputFrameOrField: 0,
+            PastFrames: 0,
+            FutureFrames: 0,
+            ppPastSurfaces: std::ptr::null_mut(),
+            pInputSurface: ManuallyDrop::new(Some(input_view)),
+            ppFutureSurfaces: std::ptr::null_mut(),
+            ppPastSurfacesRight: std::ptr::null_mut(),
+            pInputSurfaceRight: ManuallyDrop::new(None),
+            ppFutureSurfacesRight: std::ptr::null_mut(),
+        }))
+    }
+
+    fn cursor_texture(&mut self, cursor: &CursorOverlay<'_>) -> Result<ID3D11Texture2D, String> {
+        let recreate = self
+            .cursor_texture
+            .as_ref()
+            .map(|texture| texture.width != cursor.width || texture.height != cursor.height)
+            .unwrap_or(true);
+        if recreate {
+            let texture = create_default_texture(
+                &self.device,
+                cursor.width,
+                cursor.height,
+                DXGI_FORMAT_B8G8R8A8_UNORM,
+                D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            )?;
+            self.cursor_texture = Some(CursorGpuTexture {
+                texture,
+                width: cursor.width,
+                height: cursor.height,
+            });
+        }
+        let texture = self
+            .cursor_texture
+            .as_ref()
+            .ok_or_else(|| "cursor texture was not created".to_string())?
+            .texture
+            .clone();
+        unsafe {
+            self.device_context.UpdateSubresource(
+                &texture,
+                0,
+                None,
+                cursor.bytes.as_ptr().cast(),
+                cursor.pitch,
+                cursor.pitch.saturating_mul(cursor.height),
+            );
+        }
+        Ok(texture)
+    }
+
     fn sample(&self, frame_index: u64, fps: u32) -> Result<IMFSample, String> {
-        dxgi_texture_sample(&self.nv12_texture, frame_index, fps)
+        dxgi_texture_sample(
+            &self.nv12_texture,
+            frame_index,
+            fps,
+            self.width,
+            self.height,
+        )
     }
 }
 
@@ -907,6 +1204,14 @@ fn create_d3d11_device_with_context(
         device.ok_or_else(|| "D3D11CreateDevice returned no device".to_string())?,
         device_context.ok_or_else(|| "D3D11CreateDevice returned no device context".to_string())?,
     ))
+}
+
+fn protect_d3d11_multithread(device: &ID3D11Device) {
+    if let Ok(multithread) = device.cast::<ID3D11Multithread>() {
+        unsafe {
+            let _ = multithread.SetMultithreadProtected(BOOL(1));
+        }
+    }
 }
 
 struct MediaFoundationSession;
@@ -1649,9 +1954,13 @@ fn dxgi_texture_sample(
     texture: &ID3D11Texture2D,
     frame_index: u64,
     fps: u32,
+    width: u32,
+    height: u32,
 ) -> Result<IMFSample, String> {
     let buffer = unsafe { MFCreateDXGISurfaceBuffer(&ID3D11Texture2D::IID, texture, 0, false) }
         .map_err(|error| format!("MFCreateDXGISurfaceBuffer failed: {}", error))?;
+    let surface_len = width.saturating_mul(height).saturating_mul(3) / 2;
+    let _ = unsafe { buffer.SetCurrentLength(surface_len) };
     texture_sample_from_buffer(&buffer, frame_index, fps)
 }
 
