@@ -42,6 +42,7 @@ const NATIVE_TARGET_GOP_60: u32 = 4;
 // - Stronger Intel/Arc or lower resolutions: try GOP 6-8 before going as long as GOP 12.
 // - Weak iGPU or high-resolution tablet: try GOP 15-30, then lower FPS/resolution if needed.
 const HOST_SENDER_QUEUE_CAPACITY: usize = 1;
+const VIDEO_FRAGMENT_PAYLOAD_BYTES: usize = 224 * 1024;
 const MIN_IDLE_FLUSH_MS: u64 = 4;
 const MAX_IDLE_FLUSH_MS: u64 = 12;
 #[cfg(windows)]
@@ -1542,10 +1543,13 @@ fn run_stream_loop(
             guard.stats.receiver_window_dropped_packets = window_receiver_dropped_packets;
             guard.stats.receiver_window_sequence_gaps = window_receiver_sequence_gaps;
             guard.stats.bottleneck = classify_bottleneck(&guard.stats, config);
-            if !sender.last_error.is_empty() {
+            if !sender.last_error.is_empty() && !is_expected_receiver_disconnect(&sender.last_error)
+            {
                 guard.stats.last_error = sender.last_error.clone();
             } else if !receiver.last_error.is_empty() {
                 guard.stats.last_error = receiver.last_error.clone();
+            } else if is_expected_receiver_disconnect(&guard.stats.last_error) {
+                guard.stats.last_error.clear();
             }
             guard.stats.elapsed_seconds = elapsed;
             let stats = guard.stats.clone();
@@ -2063,6 +2067,15 @@ fn classify_bottleneck(stats: &StreamStats, config: &StreamConfig) -> String {
     "no obvious bottleneck in current sample".to_string()
 }
 
+fn is_expected_receiver_disconnect(error: &str) -> bool {
+    error.contains("receiver unavailable")
+        && (error.contains("socket header read failed")
+            || error.contains("connection reset")
+            || error.contains("forcibly closed")
+            || error.contains("远程主机强迫关闭了一个现有的连接")
+            || error.contains("os error 10054"))
+}
+
 fn timestamp_seconds() -> f64 {
     static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
     START.get_or_init(Instant::now).elapsed().as_secs_f64()
@@ -2145,6 +2158,62 @@ fn output_dimensions(display: &DisplayInfo, command: &[String]) -> (u32, u32) {
 }
 
 fn send_packet(
+    stream: &mut TcpStream,
+    sequence: u32,
+    timestamp_us: u64,
+    flags: u16,
+    payload: &[u8],
+    pacer: &mut SendPacer,
+) -> Result<SendReport, String> {
+    if payload.len() > VIDEO_FRAGMENT_PAYLOAD_BYTES {
+        return send_fragmented_packet(stream, sequence, timestamp_us, flags, payload, pacer);
+    }
+    send_wire_packet(stream, sequence, timestamp_us, flags, payload, pacer)
+}
+
+fn send_fragmented_packet(
+    stream: &mut TcpStream,
+    sequence: u32,
+    timestamp_us: u64,
+    flags: u16,
+    payload: &[u8],
+    pacer: &mut SendPacer,
+) -> Result<SendReport, String> {
+    let fragment_count = payload.len().div_ceil(VIDEO_FRAGMENT_PAYLOAD_BYTES);
+    if fragment_count == 0 || fragment_count > u16::MAX as usize {
+        return Err(format!(
+            "video frame too large to fragment: {} bytes",
+            payload.len()
+        ));
+    }
+
+    let mut combined = SendReport::default();
+    for (index, fragment) in payload.chunks(VIDEO_FRAGMENT_PAYLOAD_BYTES).enumerate() {
+        let fragment_offset = index * VIDEO_FRAGMENT_PAYLOAD_BYTES;
+        let fragment_payload = protocol::video_fragment_payload(
+            sequence,
+            index as u16,
+            fragment_count as u16,
+            flags,
+            fragment_offset,
+            payload.len(),
+            fragment,
+        )?;
+        let report = send_wire_packet(
+            stream,
+            sequence,
+            timestamp_us,
+            flags | protocol::FLAG_FRAGMENT,
+            &fragment_payload,
+            pacer,
+        )?;
+        combined.paced |= report.paced;
+        combined.sleep_ms += report.sleep_ms;
+    }
+    Ok(combined)
+}
+
+fn send_wire_packet(
     stream: &mut TcpStream,
     sequence: u32,
     timestamp_us: u64,
@@ -2699,6 +2768,41 @@ mod tests {
         assert_eq!(
             pacer.target_delay_for_sent(pacer.burst_bytes + 512 * 1024),
             Duration::from_millis(6)
+        );
+    }
+
+    #[test]
+    fn video_fragment_payload_carries_reassembly_metadata() {
+        let payload = protocol::video_fragment_payload(
+            42,
+            1,
+            3,
+            protocol::FLAG_KEYFRAME | protocol::FLAG_VCL,
+            224 * 1024,
+            512 * 1024,
+            &[1, 2, 3, 4],
+        )
+        .expect("fragment payload");
+
+        assert_eq!(payload.len(), protocol::VIDEO_FRAGMENT_HEADER_SIZE + 4);
+        assert_eq!(u32::from_le_bytes(payload[0..4].try_into().unwrap()), 42);
+        assert_eq!(u16::from_le_bytes(payload[4..6].try_into().unwrap()), 1);
+        assert_eq!(u16::from_le_bytes(payload[6..8].try_into().unwrap()), 3);
+        assert_eq!(
+            u16::from_le_bytes(payload[8..10].try_into().unwrap()),
+            protocol::FLAG_KEYFRAME | protocol::FLAG_VCL
+        );
+        assert_eq!(
+            u32::from_le_bytes(payload[12..16].try_into().unwrap()),
+            224 * 1024
+        );
+        assert_eq!(
+            u32::from_le_bytes(payload[16..20].try_into().unwrap()),
+            512 * 1024
+        );
+        assert_eq!(
+            &payload[protocol::VIDEO_FRAGMENT_HEADER_SIZE..],
+            &[1, 2, 3, 4]
         );
     }
 
@@ -3397,10 +3501,10 @@ impl HevcAccessUnitParser {
                 self.config_nals.extend_from_slice(&nal);
             }
             self.pending_flags |= flags;
+            self.pending.extend_from_slice(&nal);
             if nal_type <= 31 {
                 self.pending_has_vcl = true;
             }
-            self.pending.extend_from_slice(&nal);
         }
         out
     }
@@ -3421,10 +3525,10 @@ impl HevcAccessUnitParser {
                 self.config_nals.extend_from_slice(&nal);
             }
             self.pending_flags |= flags;
+            self.pending.extend_from_slice(&nal);
             if nal_type <= 31 {
                 self.pending_has_vcl = true;
             }
-            self.pending.extend_from_slice(&nal);
         }
         self.flush_pending(&mut out);
         out

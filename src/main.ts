@@ -130,7 +130,7 @@ app.innerHTML = `
       <div class="titleIdentity" data-tauri-drag-region>
         <img class="appIcon" src="${appIconUrl}" alt="" data-tauri-drag-region />
         <div data-tauri-drag-region>
-          <strong>Tablet2Screen</strong>
+          <strong>SideSlate</strong>
           <span>Host link console</span>
         </div>
       </div>

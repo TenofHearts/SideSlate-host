@@ -21,12 +21,15 @@ pub const FLAG_KEYFRAME: u16 = 0x0001;
 pub const FLAG_CONFIG_NAL: u16 = 0x0002;
 pub const FLAG_VCL: u16 = 0x0004;
 pub const FLAG_DROPPABLE: u16 = 0x0020;
+pub const FLAG_FRAGMENT: u16 = 0x0040;
 
 pub const CAP_HEVC: u32 = 0x0000_0001;
 pub const CAP_STATS: u32 = 0x0000_0004;
 pub const CAP_KEYFRAME_REQUEST: u32 = 0x0000_0008;
+pub const CAP_FRAGMENTED_VIDEO: u32 = 0x0000_0010;
 
 pub const CODEC_HEVC: u8 = 1;
+pub const VIDEO_FRAGMENT_HEADER_SIZE: usize = 20;
 
 pub const RECEIVER_STATS_PAYLOAD_SIZE: usize = 152;
 pub const RECEIVER_STATS_EXTENDED_PAYLOAD_SIZE: usize = 200;
@@ -168,8 +171,48 @@ pub fn read_message<R: Read>(reader: &mut R) -> Result<Message, String> {
 pub fn hello_payload() -> Vec<u8> {
     let mut payload = Vec::with_capacity(8);
     payload.extend_from_slice(&[1, VERSION, VERSION, 0]);
-    payload.extend_from_slice(&(CAP_HEVC | CAP_STATS | CAP_KEYFRAME_REQUEST).to_le_bytes());
+    payload.extend_from_slice(
+        &(CAP_HEVC | CAP_STATS | CAP_KEYFRAME_REQUEST | CAP_FRAGMENTED_VIDEO).to_le_bytes(),
+    );
     payload
+}
+
+pub fn video_fragment_payload(
+    frame_sequence: u32,
+    fragment_index: u16,
+    fragment_count: u16,
+    frame_flags: u16,
+    fragment_offset: usize,
+    total_len: usize,
+    fragment: &[u8],
+) -> Result<Vec<u8>, String> {
+    if fragment_count == 0 || fragment_index >= fragment_count {
+        return Err(format!(
+            "invalid fragment index {}/{}",
+            fragment_index, fragment_count
+        ));
+    }
+    if fragment_offset > total_len || fragment_offset + fragment.len() > total_len {
+        return Err(format!(
+            "invalid fragment range offset={} len={} total={}",
+            fragment_offset,
+            fragment.len(),
+            total_len
+        ));
+    }
+    if total_len > MAX_PAYLOAD_LEN as usize || fragment_offset > u32::MAX as usize {
+        return Err(format!("fragmented frame too large: {}", total_len));
+    }
+    let mut payload = Vec::with_capacity(VIDEO_FRAGMENT_HEADER_SIZE + fragment.len());
+    payload.extend_from_slice(&frame_sequence.to_le_bytes());
+    payload.extend_from_slice(&fragment_index.to_le_bytes());
+    payload.extend_from_slice(&fragment_count.to_le_bytes());
+    payload.extend_from_slice(&frame_flags.to_le_bytes());
+    payload.extend_from_slice(&0u16.to_le_bytes());
+    payload.extend_from_slice(&(fragment_offset as u32).to_le_bytes());
+    payload.extend_from_slice(&(total_len as u32).to_le_bytes());
+    payload.extend_from_slice(fragment);
+    Ok(payload)
 }
 
 pub fn video_config_payload(
