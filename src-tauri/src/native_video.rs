@@ -9,7 +9,7 @@ use windows::Win32::Graphics::Direct3D::{
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Multithread, ID3D11Texture2D,
     ID3D11VideoContext, ID3D11VideoDevice, ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator,
-    D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_CPU_ACCESS_READ,
+    D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_BOX, D3D11_CPU_ACCESS_READ,
     D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_MAPPED_SUBRESOURCE,
     D3D11_MAP_READ, D3D11_SDK_VERSION, D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV, D3D11_TEXTURE2D_DESC,
     D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
@@ -171,86 +171,123 @@ pub struct NativeHevcVideoSource {
     next_frame_due: Instant,
     frame_index: u64,
     gpu_has_frame: bool,
+    gpu_composited_pointer: Option<PointerVisualSignature>,
     last_nv12: Option<Vec<u8>>,
     pending_notice: Option<String>,
     pointer: PointerState,
     ended: bool,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct PointerState {
     visible: bool,
     position: POINT,
     shape: Option<PointerShape>,
+    system_shape_handle: isize,
 }
 
+impl PointerState {
+    fn offset(&self, dx: i32, dy: i32) -> Self {
+        let mut pointer = self.clone();
+        pointer.position = POINT {
+            x: pointer.position.x + dx,
+            y: pointer.position.y + dy,
+        };
+        pointer
+    }
+}
+
+#[derive(Clone)]
 struct PointerShape {
     info: DXGI_OUTDUPL_POINTER_SHAPE_INFO,
     bytes: Vec<u8>,
 }
 
-struct CursorOverlay<'a> {
-    bytes: &'a [u8],
+#[derive(Clone, PartialEq, Eq)]
+struct PointerVisualSignature {
+    visible: bool,
+    x: i32,
+    y: i32,
+    shape_type: u32,
     width: u32,
     height: u32,
     pitch: u32,
-    source_rect: RECT,
-    dest_rect: RECT,
+    hot_x: i32,
+    hot_y: i32,
+    system_shape_handle: isize,
+    bytes_len: usize,
+    bytes_hash: u64,
 }
 
-fn cursor_overlay<'a>(
-    pointer: &'a PointerState,
-    frame_width: u32,
-    frame_height: u32,
-) -> Option<CursorOverlay<'a>> {
+impl From<&PointerState> for PointerVisualSignature {
+    fn from(pointer: &PointerState) -> Self {
+        let Some(shape) = pointer.shape.as_ref() else {
+            return Self {
+                visible: pointer.visible,
+                x: pointer.position.x,
+                y: pointer.position.y,
+                shape_type: 0,
+                width: 0,
+                height: 0,
+                pitch: 0,
+                hot_x: 0,
+                hot_y: 0,
+                system_shape_handle: pointer.system_shape_handle,
+                bytes_len: 0,
+                bytes_hash: 0,
+            };
+        };
+        Self {
+            visible: pointer.visible,
+            x: pointer.position.x,
+            y: pointer.position.y,
+            shape_type: shape.info.Type,
+            width: shape.info.Width,
+            height: shape.info.Height,
+            pitch: shape.info.Pitch,
+            hot_x: shape.info.HotSpot.x,
+            hot_y: shape.info.HotSpot.y,
+            system_shape_handle: pointer.system_shape_handle,
+            bytes_len: shape.bytes.len(),
+            bytes_hash: shape
+                .bytes
+                .iter()
+                .fold(0xcbf29ce484222325u64, |hash, byte| {
+                    (hash ^ *byte as u64).wrapping_mul(0x100000001b3)
+                }),
+        }
+    }
+}
+
+fn pointer_dest_rect(pointer: &PointerState, frame_width: u32, frame_height: u32) -> Option<RECT> {
     if !pointer.visible {
         return None;
     }
     let shape = pointer.shape.as_ref()?;
-    if shape.info.Type != DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR.0 as u32 {
-        return None;
-    }
     let width = shape.info.Width;
-    let height = shape.info.Height;
-    let pitch = shape.info.Pitch;
-    if width == 0 || height == 0 || pitch < width.saturating_mul(4) {
-        return None;
-    }
-    if shape.bytes.len() < pitch as usize * height as usize {
+    let height = if shape.info.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME.0 as u32 {
+        shape.info.Height / 2
+    } else {
+        shape.info.Height
+    };
+    if width == 0 || height == 0 {
         return None;
     }
 
     let origin_x = pointer.position.x - shape.info.HotSpot.x;
     let origin_y = pointer.position.y - shape.info.HotSpot.y;
-    let dest_left = origin_x.max(0);
-    let dest_top = origin_y.max(0);
-    let dest_right = (origin_x + width as i32).min(frame_width as i32);
-    let dest_bottom = (origin_y + height as i32).min(frame_height as i32);
-    if dest_left >= dest_right || dest_top >= dest_bottom {
+    let left = origin_x.max(0);
+    let top = origin_y.max(0);
+    let right = (origin_x + width as i32).min(frame_width as i32);
+    let bottom = (origin_y + height as i32).min(frame_height as i32);
+    if left >= right || top >= bottom {
         return None;
     }
-    let source_left = dest_left - origin_x;
-    let source_top = dest_top - origin_y;
-    let source_right = source_left + (dest_right - dest_left);
-    let source_bottom = source_top + (dest_bottom - dest_top);
-
-    Some(CursorOverlay {
-        bytes: &shape.bytes,
-        width,
-        height,
-        pitch,
-        source_rect: RECT {
-            left: source_left,
-            top: source_top,
-            right: source_right,
-            bottom: source_bottom,
-        },
-        dest_rect: RECT {
-            left: dest_left,
-            top: dest_top,
-            right: dest_right,
-            bottom: dest_bottom,
-        },
+    Some(RECT {
+        left,
+        top,
+        right,
+        bottom,
     })
 }
 
@@ -357,6 +394,7 @@ impl NativeHevcVideoSource {
             next_frame_due: Instant::now(),
             frame_index: 0,
             gpu_has_frame: false,
+            gpu_composited_pointer: None,
             last_nv12: None,
             pending_notice: None,
             pointer: PointerState::default(),
@@ -439,9 +477,19 @@ impl NativeHevcVideoSource {
     fn recv_gpu_encoded_frame(&mut self) -> Result<Option<Vec<u8>>, String> {
         if self.capture_gpu_if_updated()? {
             self.gpu_has_frame = true;
+            self.gpu_composited_pointer = Some(PointerVisualSignature::from(&self.pointer));
         }
         if !self.gpu_has_frame {
             return Ok(None);
+        }
+        self.update_pointer_from_system_cursor(false);
+        let pointer_signature = PointerVisualSignature::from(&self.pointer);
+        if self.gpu_composited_pointer.as_ref() != Some(&pointer_signature) {
+            self.gpu_input
+                .as_mut()
+                .ok_or_else(|| "native_mf GPU input path is not available".to_string())?
+                .compose_cached_input_to_nv12(self.frame_index as u32, &self.pointer)?;
+            self.gpu_composited_pointer = Some(pointer_signature);
         }
         self.encode_gpu_texture().map(Some)
     }
@@ -493,6 +541,7 @@ impl NativeHevcVideoSource {
         self.gpu_input = None;
         self.staging_texture = Some(staging_texture);
         self.gpu_has_frame = false;
+        self.gpu_composited_pointer = None;
         self.last_nv12 = None;
         self.pending_notice = Some(format!(
             "native_mf GPU path failed, switched to CPU staging path: {}",
@@ -577,7 +626,9 @@ impl NativeHevcVideoSource {
             };
         }
         if frame_info.PointerShapeBufferSize == 0 {
-            self.update_pointer_from_system_cursor();
+            if self.pointer.shape.is_none() {
+                self.update_pointer_from_system_cursor(true);
+            }
             return Ok(());
         }
 
@@ -598,19 +649,20 @@ impl NativeHevcVideoSource {
             info: shape_info,
             bytes,
         });
-        self.update_pointer_from_system_cursor();
+        self.pointer.system_shape_handle = 0;
         Ok(())
     }
 
-    fn update_pointer_from_system_cursor(&mut self) {
+    fn update_pointer_from_system_cursor(&mut self, update_shape: bool) {
         let mut cursor = CURSORINFO {
             cbSize: std::mem::size_of::<CURSORINFO>() as u32,
             ..Default::default()
         };
-        if unsafe { GetCursorInfo(&mut cursor) }.is_err()
-            || cursor.flags.0 & CURSOR_SHOWING.0 == 0
-            || cursor.hCursor.0.is_null()
-        {
+        if unsafe { GetCursorInfo(&mut cursor) }.is_err() {
+            return;
+        }
+        if cursor.flags.0 & CURSOR_SHOWING.0 == 0 || cursor.hCursor.0.is_null() {
+            self.pointer.visible = false;
             return;
         }
         self.pointer.visible = true;
@@ -618,8 +670,16 @@ impl NativeHevcVideoSource {
             x: cursor.ptScreenPos.x - self.desktop_left,
             y: cursor.ptScreenPos.y - self.desktop_top,
         };
+        if !update_shape {
+            return;
+        }
+        let cursor_handle = cursor.hCursor.0 as isize;
+        if self.pointer.system_shape_handle == cursor_handle && self.pointer.shape.is_some() {
+            return;
+        }
         if let Some(shape) = render_system_cursor_shape(HICON(cursor.hCursor.0)) {
             self.pointer.shape = Some(shape);
+            self.pointer.system_shape_handle = cursor_handle;
         }
     }
 
@@ -816,18 +876,13 @@ struct GpuInputPath {
     device_context: ID3D11DeviceContext,
     enumerator: ID3D11VideoProcessorEnumerator,
     processor: ID3D11VideoProcessor,
+    desktop_texture: ID3D11Texture2D,
     input_texture: ID3D11Texture2D,
-    cursor_texture: Option<CursorGpuTexture>,
     nv12_texture: ID3D11Texture2D,
     device_manager: IMFDXGIDeviceManager,
     width: u32,
     height: u32,
-}
-
-struct CursorGpuTexture {
-    texture: ID3D11Texture2D,
-    width: u32,
-    height: u32,
+    input_format: DXGI_FORMAT,
 }
 
 impl GpuInputPath {
@@ -873,6 +928,13 @@ impl GpuInputPath {
             input_format,
             (D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE).0 as u32,
         )?;
+        let desktop_texture = create_default_texture(
+            device,
+            width,
+            height,
+            input_format,
+            (D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE).0 as u32,
+        )?;
         let nv12_texture = create_default_texture(
             device,
             width,
@@ -887,12 +949,13 @@ impl GpuInputPath {
             device_context: device_context.clone(),
             enumerator,
             processor,
+            desktop_texture,
             input_texture,
-            cursor_texture: None,
             nv12_texture,
             device_manager,
             width,
             height,
+            input_format,
         })
     }
 
@@ -904,8 +967,21 @@ impl GpuInputPath {
     ) -> Result<(), String> {
         unsafe {
             self.device_context
-                .CopyResource(&self.input_texture, source);
+                .CopyResource(&self.desktop_texture, source);
         }
+        self.compose_cached_input_to_nv12(frame_index, pointer)
+    }
+
+    fn compose_cached_input_to_nv12(
+        &mut self,
+        frame_index: u32,
+        pointer: &PointerState,
+    ) -> Result<(), String> {
+        unsafe {
+            self.device_context
+                .CopyResource(&self.input_texture, &self.desktop_texture);
+        }
+        self.overlay_pointer_on_input_texture(pointer)?;
         let input_desc = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
             FourCC: 0,
             ViewDimension: D3D11_VPIV_DIMENSION_TEXTURE2D,
@@ -928,7 +1004,6 @@ impl GpuInputPath {
         .map_err(|error| format!("CreateVideoProcessorInputView failed: {}", error))?;
         let input_view = input_view
             .ok_or_else(|| "CreateVideoProcessorInputView returned no view".to_string())?;
-        let cursor_stream = self.cursor_stream(pointer)?;
 
         let output_desc = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
             ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2D,
@@ -949,7 +1024,7 @@ impl GpuInputPath {
         let output_view = output_view
             .ok_or_else(|| "CreateVideoProcessorOutputView returned no view".to_string())?;
 
-        let stream = D3D11_VIDEO_PROCESSOR_STREAM {
+        let mut stream = D3D11_VIDEO_PROCESSOR_STREAM {
             Enable: BOOL(1),
             OutputIndex: 0,
             InputFrameOrField: 0,
@@ -961,131 +1036,103 @@ impl GpuInputPath {
             ppPastSurfacesRight: std::ptr::null_mut(),
             pInputSurfaceRight: ManuallyDrop::new(None),
             ppFutureSurfacesRight: std::ptr::null_mut(),
-        };
-        let mut streams = if let Some(cursor_stream) = cursor_stream {
-            vec![stream, cursor_stream]
-        } else {
-            vec![stream]
         };
         unsafe {
             self.video_context.VideoProcessorBlt(
                 &self.processor,
                 &output_view,
                 frame_index,
-                &streams,
+                std::slice::from_ref(&stream),
             )
         }
         .map_err(|error| format!("VideoProcessorBlt failed: {}", error))?;
         unsafe {
             self.device_context.Flush();
         }
-        let _ = unsafe { ManuallyDrop::take(&mut streams[0].pInputSurface) };
-        let _ = unsafe { ManuallyDrop::take(&mut streams[0].pInputSurfaceRight) };
-        if streams.len() > 1 {
-            let _ = unsafe { ManuallyDrop::take(&mut streams[1].pInputSurface) };
-            let _ = unsafe { ManuallyDrop::take(&mut streams[1].pInputSurfaceRight) };
-        }
+        let _ = unsafe { ManuallyDrop::take(&mut stream.pInputSurface) };
+        let _ = unsafe { ManuallyDrop::take(&mut stream.pInputSurfaceRight) };
         Ok(())
     }
 
-    fn cursor_stream(
-        &mut self,
-        pointer: &PointerState,
-    ) -> Result<Option<D3D11_VIDEO_PROCESSOR_STREAM>, String> {
-        let Some(cursor) = cursor_overlay(pointer, self.width, self.height) else {
-            return Ok(None);
-        };
-        let texture = self.cursor_texture(&cursor)?;
-        let input_desc = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
-            FourCC: 0,
-            ViewDimension: D3D11_VPIV_DIMENSION_TEXTURE2D,
-            Anonymous: D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0 {
-                Texture2D: D3D11_TEX2D_VPIV {
-                    MipSlice: 0,
-                    ArraySlice: 0,
-                },
-            },
-        };
-        let mut input_view = None;
-        unsafe {
-            self.video_device.CreateVideoProcessorInputView(
-                &texture,
-                &self.enumerator,
-                &input_desc,
-                Some(&mut input_view),
-            )
+    fn overlay_pointer_on_input_texture(&mut self, pointer: &PointerState) -> Result<(), String> {
+        if !pointer.visible {
+            return Ok(());
         }
-        .map_err(|error| format!("CreateVideoProcessorInputView(cursor) failed: {}", error))?;
-        let input_view = input_view
-            .ok_or_else(|| "CreateVideoProcessorInputView(cursor) returned no view".to_string())?;
-        unsafe {
-            self.video_context.VideoProcessorSetStreamSourceRect(
-                &self.processor,
-                1,
-                true,
-                Some(&cursor.source_rect),
-            );
-            self.video_context.VideoProcessorSetStreamDestRect(
-                &self.processor,
-                1,
-                true,
-                Some(&cursor.dest_rect),
-            );
-            self.video_context
-                .VideoProcessorSetStreamAlpha(&self.processor, 1, true, 1.0);
+        let Some(rect) = pointer_dest_rect(pointer, self.width, self.height) else {
+            return Ok(());
+        };
+        let rect_width = (rect.right - rect.left) as u32;
+        let rect_height = (rect.bottom - rect.top) as u32;
+        if rect_width == 0 || rect_height == 0 {
+            return Ok(());
         }
-        Ok(Some(D3D11_VIDEO_PROCESSOR_STREAM {
-            Enable: BOOL(1),
-            OutputIndex: 0,
-            InputFrameOrField: 0,
-            PastFrames: 0,
-            FutureFrames: 0,
-            ppPastSurfaces: std::ptr::null_mut(),
-            pInputSurface: ManuallyDrop::new(Some(input_view)),
-            ppFutureSurfaces: std::ptr::null_mut(),
-            ppPastSurfacesRight: std::ptr::null_mut(),
-            pInputSurfaceRight: ManuallyDrop::new(None),
-            ppFutureSurfacesRight: std::ptr::null_mut(),
-        }))
-    }
 
-    fn cursor_texture(&mut self, cursor: &CursorOverlay<'_>) -> Result<ID3D11Texture2D, String> {
-        let recreate = self
-            .cursor_texture
-            .as_ref()
-            .map(|texture| texture.width != cursor.width || texture.height != cursor.height)
-            .unwrap_or(true);
-        if recreate {
-            let texture = create_default_texture(
-                &self.device,
-                cursor.width,
-                cursor.height,
-                DXGI_FORMAT_B8G8R8A8_UNORM,
-                D3D11_BIND_SHADER_RESOURCE.0 as u32,
-            )?;
-            self.cursor_texture = Some(CursorGpuTexture {
-                texture,
-                width: cursor.width,
-                height: cursor.height,
-            });
+        let staging =
+            create_staging_texture(&self.device, rect_width, rect_height, self.input_format)?;
+        let source_box = D3D11_BOX {
+            left: rect.left as u32,
+            top: rect.top as u32,
+            front: 0,
+            right: rect.right as u32,
+            bottom: rect.bottom as u32,
+            back: 1,
+        };
+        unsafe {
+            self.device_context.CopySubresourceRegion(
+                &staging,
+                0,
+                0,
+                0,
+                0,
+                &self.input_texture,
+                0,
+                Some(&source_box),
+            );
         }
-        let texture = self
-            .cursor_texture
-            .as_ref()
-            .ok_or_else(|| "cursor texture was not created".to_string())?
-            .texture
-            .clone();
+
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        unsafe {
+            self.device_context
+                .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+        }
+        .map_err(|error| format!("native_mf cursor staging Map failed: {}", error))?;
+        let mut patch = copy_texture_rect_to_bgra(
+            mapped.pData as *const u8,
+            mapped.RowPitch as usize,
+            rect_width as usize,
+            rect_height as usize,
+            self.input_format,
+        )?;
+        overlay_pointer_bgra(
+            &mut patch,
+            rect_width as usize,
+            rect_height as usize,
+            &pointer.offset(-rect.left, -rect.top),
+        );
+        unsafe {
+            self.device_context.Unmap(&staging, 0);
+        }
+        let patch = bgra_to_texture_format(&patch, self.input_format)?;
+
+        let dest_box = D3D11_BOX {
+            left: rect.left as u32,
+            top: rect.top as u32,
+            front: 0,
+            right: rect.right as u32,
+            bottom: rect.bottom as u32,
+            back: 1,
+        };
         unsafe {
             self.device_context.UpdateSubresource(
-                &texture,
+                &self.input_texture,
                 0,
-                None,
-                cursor.bytes.as_ptr().cast(),
-                cursor.pitch,
-                cursor.pitch.saturating_mul(cursor.height),
+                Some(&dest_box),
+                patch.as_ptr().cast(),
+                rect_width.saturating_mul(4),
+                rect_width.saturating_mul(rect_height).saturating_mul(4),
             );
         }
-        Ok(texture)
+        Ok(())
     }
 
     fn sample(&self, frame_index: u64, fps: u32) -> Result<IMFSample, String> {
@@ -1599,6 +1646,71 @@ fn copy_bgra_frame_with_pointer(
     Ok(frame)
 }
 
+fn copy_texture_rect_to_bgra(
+    data: *const u8,
+    row_pitch: usize,
+    width: usize,
+    height: usize,
+    format: DXGI_FORMAT,
+) -> Result<Vec<u8>, String> {
+    if data.is_null() {
+        return Err("mapped staging texture has null data".to_string());
+    }
+    if format != DXGI_FORMAT_B8G8R8A8_UNORM && format != DXGI_FORMAT_R8G8B8A8_UNORM {
+        return Err(format!(
+            "native_mf cursor patch does not support input format {:?}",
+            format
+        ));
+    }
+    let packed_pitch = width
+        .checked_mul(4)
+        .ok_or_else(|| "native_mf cursor patch width overflow".to_string())?;
+    let mut frame = vec![
+        0u8;
+        packed_pitch
+            .checked_mul(height)
+            .ok_or_else(|| "native_mf cursor patch size overflow".to_string())?
+    ];
+    for y in 0..height {
+        let src = unsafe { std::slice::from_raw_parts(data.add(y * row_pitch), packed_pitch) };
+        let dst = &mut frame[y * packed_pitch..(y + 1) * packed_pitch];
+        if format == DXGI_FORMAT_R8G8B8A8_UNORM {
+            for (src_px, dst_px) in src.chunks_exact(4).zip(dst.chunks_exact_mut(4)) {
+                dst_px[0] = src_px[2];
+                dst_px[1] = src_px[1];
+                dst_px[2] = src_px[0];
+                dst_px[3] = src_px[3];
+            }
+        } else {
+            dst.copy_from_slice(src);
+        }
+    }
+    Ok(frame)
+}
+
+fn bgra_to_texture_format(bgra: &[u8], format: DXGI_FORMAT) -> Result<Vec<u8>, String> {
+    if format != DXGI_FORMAT_B8G8R8A8_UNORM && format != DXGI_FORMAT_R8G8B8A8_UNORM {
+        return Err(format!(
+            "native_mf cursor patch does not support output format {:?}",
+            format
+        ));
+    }
+    if bgra.len() % 4 != 0 {
+        return Err("native_mf cursor patch has non-pixel-aligned length".to_string());
+    }
+    if format == DXGI_FORMAT_B8G8R8A8_UNORM {
+        return Ok(bgra.to_vec());
+    }
+    let mut texture = vec![0u8; bgra.len()];
+    for (src_px, dst_px) in bgra.chunks_exact(4).zip(texture.chunks_exact_mut(4)) {
+        dst_px[0] = src_px[2];
+        dst_px[1] = src_px[1];
+        dst_px[2] = src_px[0];
+        dst_px[3] = src_px[3];
+    }
+    Ok(texture)
+}
+
 fn overlay_pointer_bgra(frame: &mut [u8], width: usize, height: usize, pointer: &PointerState) {
     if !pointer.visible {
         return;
@@ -2090,4 +2202,66 @@ fn mft_friendly_name(
         unsafe { String::from_utf16_lossy(std::slice::from_raw_parts(value.0, len as usize)) };
     unsafe { CoTaskMemFree(Some(value.0.cast())) };
     Some(name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pointer_with_shape_type(shape_type: u32) -> PointerState {
+        PointerState {
+            visible: true,
+            position: POINT { x: 10, y: 10 },
+            system_shape_handle: 0,
+            shape: Some(PointerShape {
+                info: DXGI_OUTDUPL_POINTER_SHAPE_INFO {
+                    Type: shape_type,
+                    Width: 8,
+                    Height: 8,
+                    Pitch: 32,
+                    HotSpot: POINT { x: 0, y: 0 },
+                },
+                bytes: vec![255; 8 * 8 * 4],
+            }),
+        }
+    }
+
+    #[test]
+    fn pointer_dest_rect_accepts_all_dxgi_pointer_shapes() {
+        let color = pointer_with_shape_type(DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR.0 as u32);
+        let masked = pointer_with_shape_type(DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR.0 as u32);
+        let mono = pointer_with_shape_type(DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME.0 as u32);
+
+        assert!(pointer_dest_rect(&color, 100, 100).is_some());
+        assert!(pointer_dest_rect(&masked, 100, 100).is_some());
+        assert!(pointer_dest_rect(&mono, 100, 100).is_some());
+    }
+
+    #[test]
+    fn texture_rect_copy_preserves_bgra_layout() {
+        let pixels = [1, 2, 3, 4, 5, 6, 7, 8];
+        let copied =
+            copy_texture_rect_to_bgra(pixels.as_ptr(), 8, 2, 1, DXGI_FORMAT_B8G8R8A8_UNORM)
+                .unwrap();
+
+        assert_eq!(copied, pixels);
+        assert_eq!(
+            bgra_to_texture_format(&copied, DXGI_FORMAT_B8G8R8A8_UNORM).unwrap(),
+            pixels
+        );
+    }
+
+    #[test]
+    fn texture_rect_copy_round_trips_rgba_layout_through_bgra() {
+        let rgba_pixels = [10, 20, 30, 40, 50, 60, 70, 80];
+        let bgra =
+            copy_texture_rect_to_bgra(rgba_pixels.as_ptr(), 8, 2, 1, DXGI_FORMAT_R8G8B8A8_UNORM)
+                .unwrap();
+
+        assert_eq!(bgra, [30, 20, 10, 40, 70, 60, 50, 80]);
+        assert_eq!(
+            bgra_to_texture_format(&bgra, DXGI_FORMAT_R8G8B8A8_UNORM).unwrap(),
+            rgba_pixels
+        );
+    }
 }
